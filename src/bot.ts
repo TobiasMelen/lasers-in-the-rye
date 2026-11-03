@@ -10,8 +10,8 @@ import { clone as cloneSkinned } from "three/examples/jsm/utils/SkeletonUtils.js
 // one JSON. Always aims along a given direction; the legs blend forward,
 // back and strafe clips by how it moves relative to that. Shared by the
 // player and the enemies. Scaled up so it reads above the grass
-const MODEL_URL = "/models/ybot.fbx"; // from Mixamo's "Defeated", with skin
-const ANIMS_URL = "/models/rifle-anims.json";
+const MODEL_URL = `${import.meta.env.BASE_URL}models/ybot.fbx`; // from Mixamo's "Defeated", with skin
+const ANIMS_URL = `${import.meta.env.BASE_URL}models/rifle-anims.json`;
 const MODEL_SCALE = 1.4;
 const FBX_UNITS = 0.01; // Mixamo FBX is in centimetres
 
