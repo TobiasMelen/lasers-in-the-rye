@@ -17,7 +17,7 @@ import WebGPUGrass, { type GrassLook } from "./WebGPUGrass";
 import { ISO_OFFSET, ISO_UP, ISO_VIEW_HEIGHT } from "./iso";
 import { noise } from "./tslNoise";
 import { raindrops } from "./rain";
-import Lasers, { SelectiveBloom, type Aim } from "./Lasers";
+import Lasers, { SelectiveBloom, type AntiAliasing, type Aim } from "./Lasers";
 import Character from "./Character";
 import Enemies from "./Enemies";
 import Warmup from "./Warmup";
@@ -262,6 +262,86 @@ function LoadingScreen({ visible }: { visible: boolean }) {
   );
 }
 
+// Drives the frames itself (the canvas runs frameloop "never"), skipping
+// display refreshes to hold a frame rate cap: on 120 Hz displays, a 60 cap
+// halves the GPU's work. 0 runs at the display's rate
+function FrameLimiter({ fps }: { fps: number }) {
+  const advance = useThree((state) => state.advance);
+  const clock = useThree((state) => state.clock);
+  useEffect(() => {
+    // A little early is fine: refreshes never land exactly on the interval
+    const interval = fps > 0 ? 1000 / fps - 2 : 0;
+    let last = -Infinity;
+    let id = requestAnimationFrame(function tick(now) {
+      id = requestAnimationFrame(tick);
+      if (now - last < interval) return;
+      // The clock runs on the timestamps given, in seconds; the first
+      // frame starts it a frame back rather than from zero
+      if (last === -Infinity && clock.elapsedTime === 0) clock.elapsedTime = now / 1000 - 1 / 60;
+      last = now;
+      advance(now / 1000);
+    });
+    return () => cancelAnimationFrame(id);
+  }, [advance, clock, fps]);
+  return null;
+}
+
+// BENCH: temporary. ?bench collects GPU/CPU frame times for window.__bench()
+const BENCH = new URLSearchParams(location.search);
+const BENCH_ON = BENCH.has("bench");
+
+function Bench() {
+  const gl = useThree((state) => state.gl) as unknown as THREE.WebGPURenderer;
+  const scene = useThree((state) => state.scene);
+  (window as unknown as { __scene: THREE.Scene }).__scene = scene;
+  const samples = useRef({ render: [] as number[], compute: [] as number[], cpu: [] as number[] });
+  const frameStart = useRef(0);
+  const frame = useRef(0);
+  const lastStart = useRef({ render: 0, compute: 0 });
+  useFrame(() => {
+    frameStart.current = performance.now();
+  }, -2);
+  useFrame(() => {
+    const s = samples.current;
+    s.cpu.push(performance.now() - frameStart.current);
+    // A resolve covers every frame since the previous one started, all
+    // tagged with the same frame id here, so average over those frames
+    frame.current++;
+    const pools = (gl.backend as unknown as {
+      timestampQueryPool: Record<string, { timestamps: Map<string, number>; pendingResolve: unknown }>;
+    }).timestampQueryPool;
+    for (const type of ["render", "compute"] as const) {
+      const pool = pools[type];
+      if (!pool || pool.pendingResolve) continue;
+      const frames = frame.current - lastStart.current[type];
+      lastStart.current[type] = frame.current;
+      gl.resolveTimestampsAsync(type).then(() => {
+        let total = 0;
+        for (const ms of pool.timestamps.values()) total += ms;
+        if (frames > 0 && total > 0) s[type].push(total / frames);
+      });
+    }
+  }, 2);
+  useEffect(() => {
+    const median = (a: number[]) => (a.length ? [...a].sort((x, y) => x - y)[a.length >> 1] : 0);
+    (window as unknown as { __bench: () => object }).__bench = () => {
+      const s = samples.current;
+      const result = {
+        frames: s.cpu.length,
+        gpuRender: +median(s.render).toFixed(2),
+        gpuCompute: +median(s.compute).toFixed(2),
+        cpu: +median(s.cpu).toFixed(2),
+        dpr: gl.getPixelRatio(),
+        size: [gl.domElement.width, gl.domElement.height],
+        samples: gl.samples,
+      };
+      s.render.length = s.compute.length = s.cpu.length = 0;
+      return result;
+    };
+  }, [gl]);
+  return null;
+}
+
 export default function App() {
   // Mutated every frame by the character; everything else reads it
   const [playerPosition] = useState(() => new THREE.Vector3());
@@ -271,10 +351,10 @@ export default function App() {
     shots: 0,
     muzzle: new THREE.Vector3(),
   }));
-  const [bolts] = useState(() => new BoltPool());
   // Everything that flattens the grass: the player, and enemies while around
   const [grassPushers] = useState(() => new Set([playerPosition]));
   const [stains] = useState(() => new Stains());
+  const [bolts] = useState(() => new BoltPool(stains));
   const groundRef = useRef();
   // Until every asset has loaded and every shader compiled, a loading
   // screen covers the view and enemies hold off
@@ -282,12 +362,32 @@ export default function App() {
   const onReady = useCallback(() => setReady(true), []);
 
   // Project description in Leva
-  const { Scene: sceneName } = useControls("Controls", {
+  const {
+    Scene: sceneName,
+    Resolution: resolution,
+    "Anti-aliasing": antiAliasing,
+    "Frame rate cap": frameRateCap,
+  } = useControls("Controls", {
     "Controls": {
       value: "WASD: Move, Mouse: Shoot",
       editable: false
     },
     Scene: { value: "Moon", options: Object.keys(SCENES) },
+    // Dev settings. On a 2x display, 1.5x resolution and no multisampling
+    // each take a large share of the GPU work
+    Resolution: { value: Number(BENCH.get("res") ?? 2), options: { "2x": 2, "1.5x": 1.5, "1x": 1 } },
+    "Anti-aliasing": {
+      value: (BENCH.get("aa") ?? "msaa") as AntiAliasing,
+      options: {
+        "MSAA 4x": "msaa",
+        SMAA: "smaa",
+        TRAA: "traa",
+        "TAAU (render 1/2)": "taau50",
+        "TAAU (render 3/4)": "taau75",
+        Off: "off",
+      } as Record<string, AntiAliasing>,
+    },
+    "Frame rate cap": { value: Number(BENCH.get("fps") ?? 60), options: { "60": 60, Display: 0 } },
   });
   const scene = SCENES[sceneName];
 
@@ -297,6 +397,8 @@ export default function App() {
       <Canvas
         flat
         orthographic
+        frameloop="never"
+        dpr={Math.min(resolution, window.devicePixelRatio)}
         camera={{ position: ISO_OFFSET, near: 1, far: 200 }}
         style={{
           userSelect: "none",
@@ -306,7 +408,10 @@ export default function App() {
         gl={async ({ canvas }) => {
           const renderer = new THREE.WebGPURenderer({
             canvas: canvas as HTMLCanvasElement,
-            antialias: true,
+            // Multisampling is the scene pass's (see SelectiveBloom); the
+            // canvas only gets the finished image
+            antialias: false,
+            trackTimestamp: BENCH_ON,
             alpha: false,
             powerPreference: "high-performance",
             // Half-float canvas with extended tone mapping: HDR output on
@@ -340,9 +445,11 @@ export default function App() {
           {/* Last, so it mounts once everything above has loaded */}
           <Warmup onReady={onReady} />
         </Suspense>
-        <SelectiveBloom />
+        <SelectiveBloom antiAliasing={antiAliasing} />
 
         <IsoCamera target={playerPosition} aim={aim} />
+        <FrameLimiter fps={frameRateCap} />
+        {BENCH_ON && <Bench />}
       </Canvas>
       <LoadingScreen visible={!ready} />
     </div>

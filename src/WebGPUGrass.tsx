@@ -33,11 +33,13 @@ import {
   select,
   int,
   saturate,
+  uniformArray,
+  If,
 } from "three/tsl";
 import { ISO_ELEVATION, ISO_RIGHT, ISO_UP, ISO_VIEW_HEIGHT } from "./iso";
 import { hash12, hash22, noise } from "./tslNoise";
 import { bareGround } from "./worldMap";
-import type { Stains } from "./stains";
+import { MAX_DENTS, MAX_STAINS, type Stains } from "./stains";
 
 // Trail map resolution (cells per side), the world size it wraps over (so
 // it holds trails within half that of the player) and the stamp radius
@@ -47,10 +49,21 @@ const TRAIL_TEXEL = TRAIL_SIZE / TRAIL_RES;
 const TRAIL_RADIUS = 1.0;
 // How hard the stamp pushes blades over at its centre
 const TRAIL_PUSH = 0.95;
+// How hard a landing blood blob pushes the blades it hits apart
+const DENT_PUSH = 0.95;
+// Square of trail map cells painted around a dent, enough for the biggest
+const DENT_CELLS = 20;
+// Square of cells painted around a stain, centred this far along its throw:
+// enough for its furthest droplets either way (metres)
+const STAIN_PAINT_SIZE = 22;
+const STAIN_PAINT_AHEAD = 6.5;
+const STAIN_CELLS = Math.ceil(STAIN_PAINT_SIZE / TRAIL_TEXEL);
 // Most things pushing the grass at once (the player and the enemies)
 const MAX_PUSHERS = 6;
 // Where unused pusher slots sit, far from any grass
 const NOWHERE = 1e6;
+// Reach of a stain slot with nothing to paint
+const NOT_PAINTING = -1e3;
 
 // Blades lean past the edges of their footprint by up to this much: wind
 // (~1.4 m at full gust on soft blades), trail push (up to TRAIL_PUSH m) and rest bend
@@ -132,9 +145,23 @@ function createGrass(bladeCount: number, stains: Stains) {
     wetness: uniform(0),
     specular: uniform(new THREE.Color(0x000000)),
     ridge: uniform(0.6),
-    // Blood splats: x, z, radius, seed (the Stains' own vectors)
-    stains: stains.spots.map((spot) => uniform(spot)),
+    // Blood splats spreading this frame: x, z, radius, throw angle (the
+    // Stains' own vectors), and how far each has spread, or NOT_PAINTING
+    stains: uniformArray(stains.spots, "vec4"),
+    stainReach: uniformArray(new Array<number>(MAX_STAINS).fill(NOT_PAINTING), "float"),
+    // Blood blobs landing this frame: x, z, radius
+    dents: uniformArray(
+      Array.from({ length: MAX_DENTS }, () => new THREE.Vector4(NOWHERE, NOWHERE, 0, 0)),
+      "vec4"
+    ),
   };
+
+  // Uniform arrays only upload once per render by default, after this
+  // frame's compute has already run on stale values; these must upload on
+  // every dispatch
+  for (const array of [uniforms.stains, uniforms.stainReach, uniforms.dents]) {
+    array.updateType = THREE.NodeUpdateType.OBJECT;
+  }
 
   // Trail map that wraps around the world, so it covers the ball wherever it
   // rolls: each cell holds the xz push vector (bend direction scaled by
@@ -142,13 +169,22 @@ function createGrass(bladeCount: number, stains: Stains) {
   // so the blades recover with an ease-out, and the id of the world tile it
   // currently covers, so cells reused for a new tile read as empty
   const trailMap = instancedArray(TRAIL_RES * TRAIL_RES, "vec4");
+  // Blood map over the same cells: how bloody, and the tile id
+  const bloodMap = instancedArray(TRAIL_RES * TRAIL_RES, "vec2");
   const tileId = (tile: THREE.Node<"vec2">) => tile.x.mul(4096.0).add(tile.y);
+  // A world cell's (unwrapped) index in the maps, and its tile
+  const wrapCell = (c: THREE.Node<"vec2">) => {
+    const tile = floor(c.div(TRAIL_RES));
+    const wrapped = c.sub(tile.mul(TRAIL_RES));
+    return { index: int(wrapped.y).mul(TRAIL_RES).add(int(wrapped.x)), tile };
+  };
 
   // Springs up fast, then settles gently into rest over a fixed time
   const recovery = (life: THREE.Node<"float">) => life.mul(life);
 
   const clearTrail = Fn(() => {
     trailMap.element(instanceIndex).assign(vec4(0.0));
+    bloodMap.element(instanceIndex).assign(vec2(0.0, NOWHERE));
   })().compute(TRAIL_RES * TRAIL_RES);
 
   // Fade the map back towards rest, then stamp the pushers' footprints
@@ -205,6 +241,76 @@ function createGrass(bladeCount: number, stains: Stains) {
     );
   })().compute(TRAIL_RES * TRAIL_RES);
 
+  // Landing blood blobs knock a small round dent outwards: one square of
+  // cells around each, only run on frames when some land
+  const DENT_AREA = DENT_CELLS * DENT_CELLS;
+  const stampDents = Fn(() => {
+    const dent = uniforms.dents.element(instanceIndex.div(DENT_AREA));
+    const local = instanceIndex.mod(DENT_AREA);
+    const c = floor(dent.xy.div(TRAIL_TEXEL))
+      .sub(DENT_CELLS / 2)
+      .add(vec2(float(local.mod(DENT_CELLS)), float(local.div(DENT_CELLS))));
+    const { index, tile } = wrapCell(c);
+    const id = tileId(tile).toVar();
+    const toCell = c.add(0.5).mul(TRAIL_TEXEL).sub(dent.xy);
+    const distance = length(toCell);
+    const strength = smoothstep(0.0, 1.0, float(1.0).sub(distance.div(max(dent.z, 1e-3)))).mul(DENT_PUSH);
+    const push = toCell.div(max(distance, 0.001)).mul(strength).toVar();
+
+    const trail = trailMap.element(index);
+    const current = select(trail.w.equal(id), trail.xy.mul(recovery(trail.z)), vec2(0.0));
+    If(dot(push, push).greaterThan(dot(current, current)), () => {
+      trail.assign(vec4(push, 1.0, id));
+    });
+  })().compute(MAX_DENTS * DENT_AREA);
+
+  // Blood: a cone sprayed out from the splat the way the bolt was going,
+  // solid near its start and breaking up towards its ragged far end, with
+  // droplets flung on past it. Painted into the blood map, over a square
+  // around each stain, only while stains spread; the strongest stays
+  const STAIN_AREA = STAIN_CELLS * STAIN_CELLS;
+  const paintStains = Fn(() => {
+    const slot = instanceIndex.div(STAIN_AREA);
+    const stain = uniforms.stains.element(slot);
+    const reach = uniforms.stainReach.element(slot);
+    If(reach.greaterThan(NOT_PAINTING / 2), () => {
+      const throwDir = vec2(cos(stain.w), sin(stain.w));
+      const local = instanceIndex.mod(STAIN_AREA);
+      const c = floor(stain.xy.add(throwDir.mul(STAIN_PAINT_AHEAD)).div(TRAIL_TEXEL))
+        .sub(STAIN_CELLS / 2)
+        .add(vec2(float(local.mod(STAIN_CELLS)), float(local.div(STAIN_CELLS))))
+        .toVar();
+      const pos = c.add(0.5).mul(TRAIL_TEXEL);
+
+      // In units of the stain's radius
+      const offset = pos.sub(stain.xy).div(stain.z);
+      const along = dot(offset, throwDir);
+      const across = abs(dot(offset, vec2(throwDir.y.negate(), throwDir.x)));
+      const rough = noise(pos.mul(1.6).add(stain.w.mul(17.0))).sub(0.5);
+      const halfWidth = along.mul(0.42).add(0.35);
+      const inCone = smoothstep(0.12, -0.12, across.sub(halfWidth).add(rough.mul(0.5)))
+        .mul(smoothstep(-0.45, -0.15, along))
+        .mul(smoothstep(4.3, 3.05, along.add(rough.mul(0.8))));
+      // Breaks up into blotches further out
+      const solid = smoothstep(along.mul(0.13).sub(0.1), along.mul(0.13).add(0.05), rough.add(0.25));
+      const patch = inCone.mul(solid);
+      const inFan = smoothstep(0.2, 0.0, across.sub(along.mul(0.5)).sub(0.3));
+      const flung = step(0.0, along).mul(inFan).mul(smoothstep(7.0, 2.75, along));
+      const droplet = step(hash12(c.add(stain.w.mul(17.0))), flung.mul(0.3));
+      // Only as far as it has spread yet, with a ragged front
+      const spread = smoothstep(0.0, 0.4, reach.sub(along).add(rough.mul(0.6)));
+      const blood = max(patch, droplet).mul(spread).toVar();
+
+      const { index, tile } = wrapCell(c);
+      const id = tileId(tile).toVar();
+      const cell = bloodMap.element(index);
+      const current = select(cell.y.equal(id), cell.x, 0.0);
+      If(blood.greaterThan(current).or(cell.y.notEqual(id)), () => {
+        cell.assign(vec2(max(blood, current), id));
+      });
+    });
+  })().compute(MAX_STAINS * STAIN_AREA);
+
   // Bilinear sample of the trail push at a world xz position
   const sampleTrail = Fn(([pos]: [THREE.Node<"vec2">]) => {
     const coord = pos.div(TRAIL_TEXEL).sub(0.5);
@@ -212,11 +318,8 @@ function createGrass(bladeCount: number, stains: Stains) {
     const c0 = floor(coord);
     // Unwrapped cell -> push, or none if the cell holds another tile
     const at = (c: THREE.Node<"vec2">) => {
-      const tile = floor(c.div(TRAIL_RES));
-      const wrapped = c.sub(tile.mul(TRAIL_RES));
-      const trail = trailMap.element(
-        int(wrapped.y).mul(TRAIL_RES).add(int(wrapped.x))
-      );
+      const { index, tile } = wrapCell(c);
+      const trail = trailMap.element(index);
       return select(
         trail.w.equal(tileId(tile)),
         trail.xy.mul(recovery(trail.z)),
@@ -320,28 +423,10 @@ function createGrass(bladeCount: number, stains: Stains) {
       widthVar.add(thicken.mul(4.0).mul(upright)).mul(select(culled, 0.0, 1.0))
     );
 
-    // Blood: a cone sprayed out from the splat the way the bolt was going,
-    // solid near its start and breaking up towards its ragged far end, with
-    // droplets flung on past it. In units of the stain's radius
-    const blood = float(0.0).toVar();
-    for (const stain of uniforms.stains) {
-      const throwDir = vec2(cos(stain.w), sin(stain.w));
-      const offset = grassPos.sub(stain.xy).div(stain.z);
-      const along = dot(offset, throwDir);
-      const across = abs(dot(offset, vec2(throwDir.y.negate(), throwDir.x)));
-      const rough = noise(grassPos.mul(1.6).add(stain.w.mul(17.0))).sub(0.5);
-      const halfWidth = along.mul(0.42).add(0.35);
-      const inCone = smoothstep(0.12, -0.12, across.sub(halfWidth).add(rough.mul(0.5)))
-        .mul(smoothstep(-0.45, -0.15, along))
-        .mul(smoothstep(4.0, 2.8, along.add(rough.mul(0.8))));
-      // Breaks up into blotches further out
-      const solid = smoothstep(along.mul(0.13).sub(0.1), along.mul(0.13).add(0.05), rough.add(0.25));
-      const patch = inCone.mul(solid);
-      const inFan = smoothstep(0.2, 0.0, across.sub(along.mul(0.5)).sub(0.3));
-      const flung = step(0.0, along).mul(inFan).mul(smoothstep(6.5, 2.5, along));
-      const droplet = step(hash12(cell.add(stain.w.mul(17.0))), flung.mul(0.3));
-      blood.assign(max(blood, max(patch, droplet)));
-    }
+    // Blood painted where this blade is rooted
+    const { index: bloodIndex, tile: bloodTile } = wrapCell(floor(grassPos.div(TRAIL_TEXEL)));
+    const bloodCell = bloodMap.element(bloodIndex);
+    const blood = select(bloodCell.y.equal(tileId(bloodTile)), bloodCell.x, 0.0);
 
     // Shadow effect from sphere
     const distanceToSphere = length(grassPos.sub(uniforms.spherePosition.xz));
@@ -489,11 +574,13 @@ function createGrass(bladeCount: number, stains: Stains) {
     uniforms,
     clearTrail,
     stampTrail,
+    stampDents,
+    paintStains,
     update,
     material,
     dispose: () => {
       material.dispose();
-      for (const buffer of [...buffers, trailMap]) buffer.value.dispose?.();
+      for (const buffer of [...buffers, trailMap, bloodMap]) buffer.value.dispose?.();
     },
   };
 }
@@ -631,11 +718,30 @@ export default function WebGPUGrass({
     }
     lastPushers.current = seen;
 
+
     if (needsClear.current) {
       renderer.compute(grass.clearTrail);
       needsClear.current = false;
     }
     renderer.compute(grass.stampTrail);
+
+    // Dents are stamped once, on top of the trails
+    let landed = false;
+    stains.dents.forEach((dent, i) => {
+      uniforms.dents.array[i].set(dent.x, dent.y, dent.z, 0);
+      landed ||= dent.z > 0;
+    });
+    stains.clearDents();
+    if (landed) renderer.compute(grass.stampDents);
+
+    // Stains are painted while they spread as their blood lands
+    stains.update(delta);
+    let spreading = false;
+    stains.spreading.forEach((painting, i) => {
+      uniforms.stainReach.array[i] = painting ? stains.reach[i] : NOT_PAINTING;
+      spreading ||= painting;
+    });
+    if (spreading) renderer.compute(grass.paintStains);
     renderer.compute(grass.update);
   });
 

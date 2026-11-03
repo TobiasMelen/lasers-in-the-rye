@@ -12,10 +12,15 @@ import {
   pass,
   pow,
   renderOutput,
+  sRGBTransferOETF,
   vec3,
   vec4,
+  velocity,
 } from "three/tsl";
 import { bloom } from "three/examples/jsm/tsl/display/BloomNode.js";
+import { smaa } from "three/examples/jsm/tsl/display/SMAANode.js";
+import { traa } from "three/examples/jsm/tsl/display/TRAANode.js";
+import { taau } from "three/examples/jsm/tsl/display/TAAUNode.js";
 import type { BoltPool } from "./bolts";
 
 // Until the character reports its rifle's muzzle, bolts aim on this plane
@@ -130,15 +135,39 @@ const CONTRAST = 1.09;
 const CONTRAST_PIVOT = 0.18;
 const EXPOSURE = 0.97;
 
-export function SelectiveBloom() {
+// TAAU renders the scene at a fraction of the output resolution (half or
+// three quarters across) and builds the full one up over frames
+export type AntiAliasing = "msaa" | "smaa" | "traa" | "taau50" | "taau75" | "off";
+
+const TAAU_SCALE: Partial<Record<AntiAliasing, number>> = { taau50: 0.5, taau75: 0.75 };
+
+export function SelectiveBloom({ antiAliasing }: { antiAliasing: AntiAliasing }) {
   const renderer = useThree((state) => state.gl) as unknown as THREE.WebGPURenderer;
   const scene = useThree((state) => state.scene);
   const camera = useThree((state) => state.camera);
 
   const pipeline = useMemo(() => {
-    const scenePass = pass(scene, camera);
-    scenePass.setMRT(mrt({ output, bloomIntensity: float(0.0) }));
-    const color = scenePass.getTextureNode();
+    // Multisampled here if at all: the scene is the only pass with edges
+    const samples = antiAliasing === "msaa" ? 4 : 0;
+    const scenePass = pass(scene, camera, { samples });
+    // The temporal ones also need each pixel's motion since last frame
+    const upscale = TAAU_SCALE[antiAliasing];
+    const temporal = antiAliasing === "traa" || upscale !== undefined;
+    scenePass.setMRT(
+      temporal
+        ? mrt({ output, bloomIntensity: float(0.0), velocity })
+        : mrt({ output, bloomIntensity: float(0.0) })
+    );
+    if (upscale !== undefined) scenePass.setResolutionScale(upscale);
+    const resolve = upscale !== undefined ? taau : traa;
+    const color = temporal
+      ? resolve(
+          scenePass.getTextureNode(),
+          scenePass.getTextureNode("depth"),
+          scenePass.getTextureNode("velocity"),
+          camera
+        )
+      : scenePass.getTextureNode();
     const mask = scenePass.getTextureNode("bloomIntensity").r;
     const glow = bloom(color.mul(mask), 2.0, 0.6, 0.0);
     // Quarter resolution (default half): the glow is soft anyway, and this
@@ -155,15 +184,18 @@ export function SelectiveBloom() {
     const filmic = acesFilmicToneMapping(hdr, float(1.0));
     const highlights = max(hdr.sub(1.0), 0.0).mul(HIGHLIGHT_KEEP);
 
+    // To sRGB here rather than in renderOutput, so SMAA finds edges in
+    // perceptual values: in linear ones the dark night scene has almost none
+    const display = vec4(sRGBTransferOETF(filmic.add(highlights)), 1.0);
     const pipeline = new THREE.RenderPipeline(renderer);
     pipeline.outputColorTransform = false;
     pipeline.outputNode = renderOutput(
-      vec4(filmic.add(highlights), 1.0),
+      antiAliasing === "smaa" ? smaa(display) : display,
       THREE.NoToneMapping,
-      THREE.SRGBColorSpace
+      THREE.LinearSRGBColorSpace
     );
     return pipeline;
-  }, [renderer, scene, camera]);
+  }, [renderer, scene, camera, antiAliasing]);
   useEffect(() => () => pipeline.dispose(), [pipeline]);
 
   useFrame(() => pipeline.render(), 1);

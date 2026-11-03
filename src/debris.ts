@@ -15,9 +15,18 @@ export type DebrisStyle = {
   gravity: number; // metres per second squared
   drag: number; // fraction of speed lost per second
   width: number; // metres
+  // Height at which a falling bit reports landing, before it reaches the
+  // ground: the grass tops it falls into
+  landAt?: number;
+  // Where bits start: a column around the burst point reaching this far
+  // below it, instead of the point itself
+  body?: { radius: number; below: number };
+  variety?: number; // each bit's size varies by up to this fraction either way
   stretch: number; // length per metre per second of speed, on top of width
   // How size falls off over life: 1 shrinks evenly, lower holds size longer
   shrink: number;
+  // How many times its size it swells by over its life, on top
+  grow?: number;
 };
 
 type Bit = {
@@ -25,6 +34,8 @@ type Bit = {
   velocity: THREE.Vector3;
   age: number;
   life: number;
+  size: number;
+  landed: boolean;
 };
 
 const zAxis = new THREE.Vector3(0, 0, 1);
@@ -42,13 +53,15 @@ export class Debris {
   constructor(
     private readonly style: DebrisStyle,
     geometry: THREE.BufferGeometry,
-    material: THREE.Material
+    material: THREE.Material,
+    // Told where each bit hits the ground, and how wide it was
+    private readonly onLand?: (position: THREE.Vector3, width: number) => void
   ) {
     this.mesh = new THREE.InstancedMesh(geometry, material, style.pool);
     this.mesh.frustumCulled = false;
     for (let i = 0; i < style.pool; i++) {
       this.mesh.setMatrixAt(i, hidden);
-      this.bits.push({ position: new THREE.Vector3(), velocity: new THREE.Vector3(), age: 1, life: 0 });
+      this.bits.push({ position: new THREE.Vector3(), velocity: new THREE.Vector3(), age: 1, life: 0, size: 1, landed: true });
     }
   }
 
@@ -59,6 +72,13 @@ export class Debris {
       const bit = this.bits[this.next];
       this.next = (this.next + 1) % style.pool;
       bit.position.copy(from);
+      if (style.body) {
+        const angle = Math.random() * Math.PI * 2;
+        const reach = Math.sqrt(Math.random()) * style.body.radius;
+        bit.position.x += Math.cos(angle) * reach;
+        bit.position.z += Math.sin(angle) * reach;
+        bit.position.y -= Math.random() * style.body.below;
+      }
       bit.velocity
         .randomDirection()
         .multiplyScalar(style.fan)
@@ -68,7 +88,9 @@ export class Debris {
         .normalize()
         .multiplyScalar(THREE.MathUtils.randFloat(...style.speed));
       bit.age = 0;
+      bit.landed = false;
       bit.life = THREE.MathUtils.randFloat(...style.life);
+      bit.size = 1 + THREE.MathUtils.randFloatSpread(2 * (style.variety ?? 0));
     }
   }
 
@@ -80,6 +102,10 @@ export class Debris {
       if (bit.age >= bit.life) continue;
       bit.age += delta;
       // Gone once spent, or on reaching the ground
+      if (!bit.landed && bit.velocity.y < 0 && bit.position.y < (style.landAt ?? 0)) {
+        bit.landed = true;
+        this.onLand?.(bit.position, style.width * bit.size);
+      }
       if (bit.age >= bit.life || bit.position.y < 0) {
         bit.age = bit.life;
         this.mesh.setMatrixAt(i, hidden);
@@ -89,7 +115,8 @@ export class Debris {
       bit.velocity.y -= style.gravity * delta;
       bit.position.addScaledVector(bit.velocity, delta);
       const speed = Math.max(bit.velocity.length(), 1e-3);
-      const size = (1 - bit.age / bit.life) ** style.shrink;
+      const t = bit.age / bit.life;
+      const size = bit.size * (1 - t) ** style.shrink * (1 + (style.grow ?? 0) * t);
       rotation.setFromUnitVectors(zAxis, heading.copy(bit.velocity).divideScalar(speed));
       scale.set(style.width * size, style.width * size, (style.width + speed * style.stretch) * size);
       this.mesh.setMatrixAt(i, matrix.compose(bit.position, rotation, scale));

@@ -32,6 +32,9 @@ const RIFLE_HEIGHT = 0.13;
 const AIM_CORRECTION_RATE = 10; // per second
 const AIM_CORRECTION_MAX = 0.8; // radians
 
+// How many times the firing clip's own kick the recoil moves the body
+const RECOIL_STRENGTH = 3.75;
+
 // Bones the firing recoil leaves alone, so it only moves the upper body
 const LOWER_BODY = /Hips|Leg|Foot|Toe/;
 
@@ -259,6 +262,8 @@ export class Bot {
     this.right = gait("strafeRight");
     this.fire = this.mixer.clipAction(assets.recoil);
     this.fire.setLoop(THREE.LoopOnce, 1);
+    // Additive, so a weight above 1 exaggerates the kick
+    this.fire.weight = RECOIL_STRENGTH;
     for (const action of [this.idle, this.walk.action, this.run.action, this.left.action, this.right.action]) {
       action.play();
     }
