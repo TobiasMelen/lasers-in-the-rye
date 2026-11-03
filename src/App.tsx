@@ -1,5 +1,5 @@
-import { Suspense, useRef, useState, useEffect, useLayoutEffect, useMemo } from "react";
-import { Canvas, extend, useFrame, useThree, type Catalogue } from "@react-three/fiber";
+import { Suspense, useCallback, useRef, useState, useEffect, useLayoutEffect, useMemo } from "react";
+import { Canvas, extend, useFrame, useLoader, useThree, type Catalogue } from "@react-three/fiber";
 import * as THREE from "three/webgpu";
 import {
   color,
@@ -20,6 +20,7 @@ import { raindrops } from "./rain";
 import Lasers, { SelectiveBloom, type Aim } from "./Lasers";
 import Character from "./Character";
 import Enemies from "./Enemies";
+import Warmup from "./Warmup";
 import { BoltPool } from "./bolts";
 import { Stains } from "./stains";
 import { ClusteredLighting } from "./lighting/ClusteredLighting";
@@ -94,11 +95,18 @@ function SceneLighting({ preset }: { preset: ScenePreset }) {
 // larger so the cracks read at iso distance
 const GRAVEL_TILE = 8;
 
-function loadTiling(url: string, colorSpace: string) {
-  const map = new THREE.TextureLoader().load(url);
+const GRAVEL_URLS = [
+  `${import.meta.env.BASE_URL}textures/brown_mud_03_diff_512.webp`,
+  `${import.meta.env.BASE_URL}textures/brown_mud_03_nor_gl_512.webp`,
+  // Packed ambient occlusion, roughness, metalness
+  `${import.meta.env.BASE_URL}textures/brown_mud_03_arm_512.webp`,
+];
+
+function tiling(map: THREE.Texture, colorSpace: string) {
   map.wrapS = map.wrapT = THREE.RepeatWrapping;
   map.colorSpace = colorSpace;
   map.anisotropy = 8;
+  map.needsUpdate = true;
   return map;
 }
 
@@ -111,20 +119,12 @@ function Ground({ groundRef, follow, lightColor }) {
     light.value.set(lightColor);
   }, [light, lightColor]);
 
+  const gravelMaps = useLoader(THREE.TextureLoader, GRAVEL_URLS);
+
   const material = useMemo(() => {
-    const gravelColor = loadTiling(
-      `${import.meta.env.BASE_URL}textures/brown_mud_03_diff_512.webp`,
-      THREE.SRGBColorSpace
-    );
-    const gravelNormal = loadTiling(
-      `${import.meta.env.BASE_URL}textures/brown_mud_03_nor_gl_512.webp`,
-      THREE.NoColorSpace
-    );
-    // Packed ambient occlusion, roughness, metalness
-    const gravelArm = loadTiling(
-      `${import.meta.env.BASE_URL}textures/brown_mud_03_arm_512.webp`,
-      THREE.NoColorSpace
-    );
+    const gravelColor = tiling(gravelMaps[0], THREE.SRGBColorSpace);
+    const gravelNormal = tiling(gravelMaps[1], THREE.NoColorSpace);
+    const gravelArm = tiling(gravelMaps[2], THREE.NoColorSpace);
 
     const mat = new THREE.MeshStandardNodeMaterial({ roughness: 1 });
     const xz = positionWorld.xz;
@@ -175,7 +175,7 @@ function Ground({ groundRef, follow, lightColor }) {
       vec2(bare.mul(2.0).mul(puddle.oneMinus()))
     );
     return mat;
-  }, [light, time]);
+  }, [gravelMaps, light, time]);
   useEffect(() => () => material.dispose(), [material]);
 
   useFrame((state) => {
@@ -237,6 +237,31 @@ function IsoCamera({ target, aim }: { target: THREE.Vector3; aim: Aim }) {
   return null;
 }
 
+// Covers the view while assets load and shaders compile, then fades out
+function LoadingScreen({ visible }: { visible: boolean }) {
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        background: "#070b16",
+        color: "#8fa0c8",
+        font: "500 14px/1 ui-monospace, SFMono-Regular, Menlo, monospace",
+        letterSpacing: "0.2em",
+        textTransform: "uppercase",
+        opacity: visible ? 1 : 0,
+        pointerEvents: visible ? "auto" : "none",
+        transition: "opacity 0.6s ease",
+      }}
+    >
+      Loading…
+    </div>
+  );
+}
+
 export default function App() {
   // Mutated every frame by the character; everything else reads it
   const [playerPosition] = useState(() => new THREE.Vector3());
@@ -251,6 +276,10 @@ export default function App() {
   const [grassPushers] = useState(() => new Set([playerPosition]));
   const [stains] = useState(() => new Stains());
   const groundRef = useRef();
+  // Until every asset has loaded and every shader compiled, a loading
+  // screen covers the view and enemies hold off
+  const [ready, setReady] = useState(false);
+  const onReady = useCallback(() => setReady(true), []);
 
   // Project description in Leva
   const { Scene: sceneName } = useControls("Controls", {
@@ -292,21 +321,30 @@ export default function App() {
       >
         <SceneLighting key={sceneName} preset={scene} />
 
-        <Ground
-          groundRef={groundRef}
-          follow={playerPosition}
-          lightColor={scene.light.color}
-        />
         <WebGPUGrass spherePosition={playerPosition} pushers={grassPushers} stains={stains} look={scene.grass} sunPosition={scene.light.position} />
-        <Suspense fallback={null}>
-          <Character position={playerPosition} aim={aim} bolts={bolts} />
-          <Enemies player={playerPosition} bolts={bolts} grassPushers={grassPushers} stains={stains} />
-        </Suspense>
         <Lasers origin={playerPosition} aim={aim} bolts={bolts} />
+        <Suspense fallback={null}>
+          <Ground
+            groundRef={groundRef}
+            follow={playerPosition}
+            lightColor={scene.light.color}
+          />
+          <Character position={playerPosition} aim={aim} bolts={bolts} />
+          <Enemies
+            player={playerPosition}
+            bolts={bolts}
+            grassPushers={grassPushers}
+            stains={stains}
+            active={ready}
+          />
+          {/* Last, so it mounts once everything above has loaded */}
+          <Warmup onReady={onReady} />
+        </Suspense>
         <SelectiveBloom />
 
         <IsoCamera target={playerPosition} aim={aim} />
       </Canvas>
+      <LoadingScreen visible={!ready} />
     </div>
   );
 }

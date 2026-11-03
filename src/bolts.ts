@@ -1,5 +1,5 @@
 import * as THREE from "three/webgpu";
-import { float, mrt, pow, uniform, uv, vec3 } from "three/tsl";
+import { float, mrt, pow, uv, vec3 } from "three/tsl";
 import { Debris, type DebrisStyle } from "./debris";
 
 // Red laser bolts, shared by everyone who shoots. Each flies level from
@@ -105,10 +105,10 @@ type Bolt = {
   head: number; // distance of the front end from the origin
   age: number;
   burst: number; // time since it burst, or -1 while flying
-  cone: THREE.Mesh;
+  index: number; // its instance in the cone mesh
+  coneRotation: THREE.Quaternion;
   coneLength: number;
   coneRadius: number;
-  coneGlow: ReturnType<typeof uniform<number>>;
 };
 
 
@@ -117,6 +117,10 @@ const yAxis = new THREE.Vector3(0, 1, 0);
 const toTarget = new THREE.Vector2();
 const impact = new THREE.Vector3();
 const coneAxis = new THREE.Vector3();
+const coneMatrix = new THREE.Matrix4();
+const coneScale = new THREE.Vector3();
+const coneGlow = new THREE.Color();
+const hidden = new THREE.Matrix4().makeScale(0, 0, 0);
 
 export class BoltPool {
   readonly group = new THREE.Group();
@@ -133,7 +137,16 @@ export class BoltPool {
     opacity: 0.85,
   });
   private readonly coneGeometry = new THREE.ConeGeometry(1, 1, 24, 1, true);
-  private readonly coneMaterials: THREE.Material[] = [];
+  // Every cone in one instanced draw: glowing, added on top, brightest at
+  // the apex and fading to nothing at the open end. Each fades on its own
+  // through its instance colour
+  private readonly coneMaterial = new THREE.MeshBasicNodeMaterial({
+    transparent: true,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  });
+  private readonly cones: THREE.InstancedMesh;
   private readonly sparks: Debris;
   private readonly blood: Debris;
 
@@ -146,6 +159,10 @@ export class BoltPool {
     // Apex at the origin, opening along +y, so it scales to length and width
     this.coneGeometry.rotateX(Math.PI);
     this.coneGeometry.translate(0, 0.5, 0);
+    this.coneMaterial.colorNode = vec3(3.0, 0.09, 0.05).mul(pow(uv().y, 1.3));
+    this.coneMaterial.mrtNode = mrt({ bloomIntensity: float(1.0) });
+    this.cones = new THREE.InstancedMesh(this.coneGeometry, this.coneMaterial, POOL_SIZE);
+    this.cones.frustumCulled = false;
 
     for (let i = 0; i < POOL_SIZE; i++) {
       const mesh = new THREE.Mesh(this.geometry, this.material);
@@ -153,23 +170,9 @@ export class BoltPool {
       mesh.frustumCulled = false;
       const light = new THREE.PointLight(LIGHT_COLOR, 0, LIGHT_RANGE, 2);
 
-      // Glowing, added on top, brightest at the apex and fading to nothing
-      // at the open end; each cone fades on its own
-      const coneGlow = uniform(0);
-      const coneMaterial = new THREE.MeshBasicNodeMaterial({
-        transparent: true,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-        side: THREE.DoubleSide,
-      });
-      coneMaterial.colorNode = vec3(3.0, 0.09, 0.05).mul(pow(uv().y, 1.3)).mul(coneGlow);
-      coneMaterial.mrtNode = mrt({ bloomIntensity: float(1.0) });
-      this.coneMaterials.push(coneMaterial);
-      const cone = new THREE.Mesh(this.coneGeometry, coneMaterial);
-      cone.visible = false;
-      cone.frustumCulled = false;
-
-      this.group.add(mesh, light, cone);
+      this.group.add(mesh, light);
+      this.cones.setMatrixAt(i, hidden);
+      this.cones.setColorAt(i, coneGlow.setScalar(0));
       this.bolts.push({
         mesh,
         light,
@@ -179,17 +182,17 @@ export class BoltPool {
         head: 0,
         age: BOLT_LIFE,
         burst: -1,
-        cone,
+        index: i,
+        coneRotation: new THREE.Quaternion(),
         coneLength: CONE_LENGTH,
         coneRadius: CONE_RADIUS,
-        coneGlow,
       });
     }
 
     // Same glowing material, so sparks bloom too
     this.sparks = new Debris(SPARKS, this.sparkGeometry, this.material);
     this.blood = new Debris(BLOOD, this.bloodGeometry, this.bloodMaterial);
-    this.group.add(this.sparks.mesh, this.blood.mesh);
+    this.group.add(this.cones, this.sparks.mesh, this.blood.mesh);
   }
 
   // Fire from a muzzle along a level direction, reusing the oldest bolt
@@ -197,6 +200,7 @@ export class BoltPool {
     const bolt = this.bolts[this.next];
     this.next = (this.next + 1) % this.bolts.length;
     bolt.team = team;
+    if (bolt.burst >= 0) this.hideCone(bolt);
     bolt.age = 0;
     bolt.head = 0;
     bolt.burst = -1;
@@ -257,17 +261,15 @@ export class BoltPool {
     bolt.burst = 0;
     bolt.origin.copy(impact);
     bolt.light.distance = BURST_LIGHT_RANGE;
-    bolt.cone.position.copy(impact);
     coneAxis
       .copy(bolt.direction)
       .applyAxisAngle(yAxis, THREE.MathUtils.randFloatSpread(CONE_JITTER * 2));
     coneAxis.y = THREE.MathUtils.randFloatSpread(CONE_JITTER);
-    bolt.cone.quaternion.setFromUnitVectors(yAxis, coneAxis.normalize());
+    bolt.coneRotation.setFromUnitVectors(yAxis, coneAxis.normalize());
     // Random size, and a little random in its proportions
     const size = THREE.MathUtils.randFloat(CONE_MIN_SIZE, 1);
     bolt.coneLength = CONE_LENGTH * size;
     bolt.coneRadius = CONE_RADIUS * size * THREE.MathUtils.randFloat(0.75, 1);
-    bolt.cone.visible = true;
 
     this.sparks.burst(impact, bolt.direction);
     this.blood.burst(impact, bolt.direction);
@@ -279,7 +281,7 @@ export class BoltPool {
     bolt.burst += delta;
     if (bolt.burst >= BURST_TIME) {
       bolt.burst = -1;
-      bolt.cone.visible = false;
+      this.hideCone(bolt);
       this.end(bolt);
       return;
     }
@@ -287,9 +289,15 @@ export class BoltPool {
     // The cone shoots out to full length, widening, as it fades
     const shot = Math.min(bolt.burst / CONE_TIME, 1);
     const reach = 1 - (1 - shot) ** 3;
-    bolt.cone.visible = shot < 1;
-    bolt.cone.scale.set(bolt.coneRadius * reach, bolt.coneLength * reach, bolt.coneRadius * reach);
-    bolt.coneGlow.value = (1 - shot) ** 2;
+    if (shot < 1) {
+      coneScale.set(bolt.coneRadius * reach, bolt.coneLength * reach, bolt.coneRadius * reach);
+      this.cones.setMatrixAt(bolt.index, coneMatrix.compose(bolt.origin, bolt.coneRotation, coneScale));
+      this.cones.setColorAt(bolt.index, coneGlow.setScalar((1 - shot) ** 2));
+      this.cones.instanceMatrix.needsUpdate = true;
+      this.cones.instanceColor!.needsUpdate = true;
+    } else {
+      this.hideCone(bolt);
+    }
     // Slam: bolt length and thickness to the flat head's, then thin away
     // while spreading. Sizes along the path include the capsule's caps
     const slam = 1 - (1 - Math.min(bolt.burst / HEAD_SLAM, 1)) ** 2;
@@ -322,6 +330,11 @@ export class BoltPool {
     return null;
   }
 
+  private hideCone(bolt: Bolt) {
+    this.cones.setMatrixAt(bolt.index, hidden);
+    this.cones.instanceMatrix.needsUpdate = true;
+  }
+
   private end(bolt: Bolt) {
     bolt.age = BOLT_LIFE;
     bolt.mesh.visible = false;
@@ -335,6 +348,6 @@ export class BoltPool {
     this.bloodMaterial.dispose();
     this.coneGeometry.dispose();
     this.material.dispose();
-    for (const material of this.coneMaterials) material.dispose();
+    this.coneMaterial.dispose();
   }
 }

@@ -53,11 +53,14 @@ export default function Enemies({
   bolts,
   grassPushers,
   stains,
+  active,
 }: {
   player: THREE.Vector3;
   bolts: BoltPool;
   grassPushers: Set<THREE.Vector3>;
   stains: Stains;
+  // Hold off (no arrivals, nothing moves) until play starts
+  active: boolean;
 }) {
   const assets = useBotAssets();
 
@@ -107,6 +110,7 @@ export default function Enemies({
   );
 
   useFrame((_, delta) => {
+    if (!active) return;
     // Arrivals
     spawn.timer -= delta;
     if (spawn.timer <= 0) {
