@@ -2,26 +2,21 @@ import { useLoader } from "@react-three/fiber";
 import { useMemo } from "react";
 import * as THREE from "three/webgpu";
 import { mix, output, positionWorld, smoothstep, vec4 } from "three/tsl";
-import { FBXLoader } from "three/examples/jsm/loaders/FBXLoader.js";
+import { GLTFLoader, type GLTF } from "three/examples/jsm/loaders/GLTFLoader.js";
+import { MeshoptDecoder } from "three/examples/jsm/libs/meshopt_decoder.module.js";
 import { clone as cloneSkinned } from "three/examples/jsm/utils/SkeletonUtils.js";
 
-// Mixamo's Y Bot in polished metal (silver or gold) with a placeholder rifle, driven by
-// Mixamo rifle clips baked from the FBX pack by scripts outside the app into
-// one JSON. Always aims along a given direction; the legs blend forward,
-// back and strafe clips by how it moves relative to that. Shared by the
-// player and the enemies. Scaled up so it reads above the grass
-const MODEL_URL = `${import.meta.env.BASE_URL}models/ybot.fbx`; // from Mixamo's "Defeated", with skin
-const ANIMS_URL = `${import.meta.env.BASE_URL}models/rifle-anims.json`;
+// Mixamo's Y Bot in polished metal (silver or gold) with a placeholder
+// rifle, driven by Mixamo rifle clips. Both are baked from the Mixamo FBX
+// downloads, outside the app, into one simplified, meshopt compressed GLB.
+// Always aims along a given direction; the legs blend forward, back and
+// strafe clips by how it moves relative to that. Shared by the player and
+// the enemies. Scaled up so it reads above the grass
+const MODEL_URL = `${import.meta.env.BASE_URL}models/bot.glb`;
 const MODEL_SCALE = 1.4;
-const FBX_UNITS = 0.01; // Mixamo FBX is in centimetres
+const SOURCE_UNITS = 0.01; // the Mixamo source is in centimetres
 
 const TURN_RATE = 14; // how quickly the body turns to face, per second
-
-type RifleAnims = {
-  clips: object[];
-  // Ground speed each locomotion clip was authored at, before MODEL_SCALE
-  speeds: Record<string, number>;
-};
 
 // Placeholder rifle: a level block from behind the right hand out past the
 // left, which the clips hold it with. Its far end is where bolts leave from
@@ -154,10 +149,14 @@ export type BotAssets = {
   rifleMaterial: THREE.Material;
 };
 
-// Built once per loaded model, since every bot shares its materials
-const assetCache = new WeakMap<THREE.Group, BotAssets>();
+// Built once per loaded file, since every bot shares its materials
+const assetCache = new WeakMap<GLTF, BotAssets>();
 
-function buildAssets(model: THREE.Group, anims: RifleAnims): BotAssets {
+function buildAssets(gltf: GLTF): BotAssets {
+  // The baked file's root: the model, with the clips' authored ground
+  // speeds (before MODEL_SCALE) in its extras
+  const model = gltf.scene.children[0] as THREE.Group;
+  const speeds = model.userData.speeds as Record<string, number>;
   const reflections = nightReflections();
   const materials = {
     silver: finishMaterials("silver", reflections),
@@ -170,7 +169,7 @@ function buildAssets(model: THREE.Group, anims: RifleAnims): BotAssets {
     for (const old of [object.material].flat()) old.dispose();
   });
 
-  const clips = anims.clips.map((json) => THREE.AnimationClip.parse(json));
+  const clips = gltf.animations;
   // Recoil as an offset from the clip's first frame, layered on top
   const recoil = THREE.AnimationClip.findByName(clips, "fire").clone();
   recoil.tracks = recoil.tracks.filter((track) => !LOWER_BODY.test(track.name));
@@ -185,22 +184,21 @@ function buildAssets(model: THREE.Group, anims: RifleAnims): BotAssets {
     roughness: 0.4,
   });
 
-  return { model, materials, clips, speeds: anims.speeds, recoil, rifleGeometry, rifleMaterial };
+  return { model, materials, clips, speeds, recoil, rifleGeometry, rifleMaterial };
 }
 
 export function useBotAssets(): BotAssets {
-  const model = useLoader(FBXLoader, MODEL_URL);
-  const anims = useLoader(THREE.FileLoader, ANIMS_URL, (loader) =>
-    loader.setResponseType("json")
-  ) as unknown as RifleAnims;
+  const gltf = useLoader(GLTFLoader, MODEL_URL, (loader) =>
+    loader.setMeshoptDecoder(MeshoptDecoder)
+  );
   return useMemo(() => {
-    let assets = assetCache.get(model);
+    let assets = assetCache.get(gltf);
     if (!assets) {
-      assets = buildAssets(model, anims);
-      assetCache.set(model, assets);
+      assets = buildAssets(gltf);
+      assetCache.set(gltf, assets);
     }
     return assets;
-  }, [model, anims]);
+  }, [gltf]);
 }
 
 type Gait = { action: THREE.AnimationAction; stride: number; speed: number };
@@ -240,7 +238,7 @@ export class Bot {
         object.material = object.name.endsWith("_Joints") ? materials.joints : materials.shell;
       }
     });
-    model.scale.setScalar(MODEL_SCALE * FBX_UNITS);
+    model.scale.setScalar(MODEL_SCALE * SOURCE_UNITS);
     this.body.add(model);
     this.rifle = new THREE.Mesh(assets.rifleGeometry, assets.rifleMaterial);
     this.object.add(this.body, this.rifle);

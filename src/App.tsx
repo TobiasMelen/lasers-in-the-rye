@@ -113,16 +113,16 @@ function Ground({ groundRef, follow, lightColor }) {
 
   const material = useMemo(() => {
     const gravelColor = loadTiling(
-      `${import.meta.env.BASE_URL}textures/brown_mud_03_diff_1k.jpg`,
+      `${import.meta.env.BASE_URL}textures/brown_mud_03_diff_512.webp`,
       THREE.SRGBColorSpace
     );
     const gravelNormal = loadTiling(
-      `${import.meta.env.BASE_URL}textures/brown_mud_03_nor_gl_1k.jpg`,
+      `${import.meta.env.BASE_URL}textures/brown_mud_03_nor_gl_512.webp`,
       THREE.NoColorSpace
     );
     // Packed ambient occlusion, roughness, metalness
     const gravelArm = loadTiling(
-      `${import.meta.env.BASE_URL}textures/brown_mud_03_arm_1k.jpg`,
+      `${import.meta.env.BASE_URL}textures/brown_mud_03_arm_512.webp`,
       THREE.NoColorSpace
     );
 
