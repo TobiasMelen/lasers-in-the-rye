@@ -23,6 +23,7 @@ const LAYERS: [number, number][] = [
 const dropLayer = (
   xz: THREE.Node<"vec2">,
   time: THREE.Node<"float">,
+  wobble: THREE.Node<"float">,
   offset: number,
   layerSeed: number
 ) => {
@@ -38,8 +39,7 @@ const dropLayer = (
   // Each drop gets its own size and strength
   const size = hash12(seed.add(-2.9)).mul(0.6).add(0.4);
   const strength = hash12(seed.add(8.3)).mul(0.7).add(0.3);
-  // Wobble the ring's radius and break its line up so it isn't a clean circle
-  const wobble = noise(xz.mul(18.0)).sub(0.5).mul(0.03);
+  // Break the ring's line up so it isn't a clean circle
   const distance = length(fract(p).sub(center)).mul(CELL).add(wobble);
   const ring = smoothstep(
     0.015,
@@ -53,9 +53,11 @@ const dropLayer = (
 // Ring brightness at a world xz position
 export const raindrops = Fn(
   ([xz, time]: [THREE.Node<"vec2">, THREE.Node<"float">]) => {
+    // Wobbles every ring's radius, the same in every layer
+    const wobble = noise(xz.mul(18.0)).sub(0.5).mul(0.03).toVar();
     let rings: THREE.Node<"float"> = float(0.0);
     for (const [offset, layerSeed] of LAYERS) {
-      rings = rings.add(dropLayer(xz, time, offset, layerSeed));
+      rings = rings.add(dropLayer(xz, time, wobble, offset, layerSeed));
     }
     return rings;
   }

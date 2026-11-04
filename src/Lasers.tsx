@@ -12,6 +12,7 @@ import {
   pass,
   pow,
   renderOutput,
+  saturate,
   sRGBTransferOETF,
   vec3,
   vec4,
@@ -121,8 +122,10 @@ export default function Lasers({
   return <primitive object={bolts.group} />;
 }
 
-// Takes over rendering: the scene pass also writes a bloom mask, which only
-// the bolts' material sets, so only they bloom. Tone mapping is done here:
+// Takes over rendering: only what the bolts' materials flag blooms. The
+// flag rides in the scene colour's alpha, unused otherwise, rather than a
+// target of its own: opaque surfaces and the background write 1, the bolts
+// 0, so the mask is its inverse. Tone mapping is done here:
 // ACES Filmic for the normal range, with what lies above 1 added back on top
 // so bright highlights reach HDR displays
 const HIGHLIGHT_KEEP = 0.6;
@@ -153,11 +156,7 @@ export function SelectiveBloom({ antiAliasing }: { antiAliasing: AntiAliasing })
     // The temporal ones also need each pixel's motion since last frame
     const upscale = TAAU_SCALE[antiAliasing];
     const temporal = antiAliasing === "traa" || upscale !== undefined;
-    scenePass.setMRT(
-      temporal
-        ? mrt({ output, bloomIntensity: float(0.0), velocity })
-        : mrt({ output, bloomIntensity: float(0.0) })
-    );
+    scenePass.setMRT(temporal ? mrt({ output, velocity }) : mrt({ output }));
     if (upscale !== undefined) scenePass.setResolutionScale(upscale);
     const resolve = upscale !== undefined ? taau : traa;
     const color = temporal
@@ -168,7 +167,7 @@ export function SelectiveBloom({ antiAliasing }: { antiAliasing: AntiAliasing })
           camera
         )
       : scenePass.getTextureNode();
-    const mask = scenePass.getTextureNode("bloomIntensity").r;
+    const mask = saturate(scenePass.getTextureNode().a.oneMinus());
     const glow = bloom(color.mul(mask), 2.0, 0.6, 0.0);
     // Quarter resolution (default half): the glow is soft anyway, and this
     // makes every blur step about 4x cheaper

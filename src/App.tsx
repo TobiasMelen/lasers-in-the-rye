@@ -3,6 +3,9 @@ import { Canvas, extend, useFrame, useLoader, useThree, type Catalogue } from "@
 import * as THREE from "three/webgpu";
 import {
   color,
+  Fn,
+  If,
+  vec3,
   mix,
   normalMap,
   positionWorld,
@@ -166,8 +169,15 @@ function Ground({ groundRef, follow, lightColor }) {
     mat.aoNode = occlusion;
     mat.metalnessNode = puddle;
     mat.roughnessNode = mix(mix(1.0, arm.g, bare), 0.05, max(puddle, wet.mul(0.5)));
-    // Raindrop rings catch the moon/sunlight
-    mat.emissiveNode = light.mul(raindrops(xz, time).mul(0.45)).mul(puddle);
+    // Raindrop rings catch the moon/sunlight. Only worked out on puddles,
+    // the rest of the ground skips them
+    mat.emissiveNode = Fn(() => {
+      const rings = vec3(0.0).toVar();
+      If(puddle.greaterThan(0.0), () => {
+        rings.assign(light.mul(raindrops(xz, time).mul(0.45)).mul(puddle));
+      });
+      return rings;
+    })();
     // Doubled normal strength so the relief reads from the iso distance;
     // water lies flat
     mat.normalNode = normalMap(
@@ -274,7 +284,7 @@ function FrameLimiter({ fps }: { fps: number }) {
     let last = -Infinity;
     let id = requestAnimationFrame(function tick(now) {
       id = requestAnimationFrame(tick);
-      if (now - last < interval) return;
+      if (burning || now - last < interval) return;
       // The clock runs on the timestamps given, in seconds; the first
       // frame starts it a frame back rather than from zero
       if (last === -Infinity && clock.elapsedTime === 0) clock.elapsedTime = now / 1000 - 1 / 60;
@@ -289,9 +299,13 @@ function FrameLimiter({ fps }: { fps: number }) {
 // BENCH: temporary. ?bench collects GPU/CPU frame times for window.__bench()
 const BENCH = new URLSearchParams(location.search);
 const BENCH_ON = BENCH.has("bench");
+// Set while window.__burn drives the frames itself
+let burning = false;
 
 function Bench() {
   const gl = useThree((state) => state.gl) as unknown as THREE.WebGPURenderer;
+  const advance = useThree((state) => state.advance);
+  const clock = useThree((state) => state.clock);
   const scene = useThree((state) => state.scene);
   (window as unknown as { __scene: THREE.Scene }).__scene = scene;
   const samples = useRef({ render: [] as number[], compute: [] as number[], cpu: [] as number[] });
@@ -338,7 +352,29 @@ function Bench() {
       s.render.length = s.compute.length = s.cpu.length = 0;
       return result;
     };
-  }, [gl]);
+    // Renders frames back to back, with no wait for the display, at a
+    // fixed 60 fps game step, keeping two frames in flight on the GPU
+    (window as unknown as { __burn: (frames?: number) => Promise<object> }).__burn = async (frames = 600) => {
+      const device = (gl.backend as unknown as { device: GPUDevice }).device;
+      burning = true;
+      await device.queue.onSubmittedWorkDone();
+      let time = clock.elapsedTime;
+      let previous: Promise<undefined> = Promise.resolve(undefined);
+      const start = performance.now();
+      for (let i = 0; i < frames; i++) {
+        time += 1 / 60;
+        advance(time);
+        const done = device.queue.onSubmittedWorkDone();
+        await previous;
+        previous = done;
+      }
+      await previous;
+      const ms = performance.now() - start;
+      clock.elapsedTime = performance.now() / 1000 - 1 / 60;
+      burning = false;
+      return { frames, ms: +(ms / frames).toFixed(2), fps: Math.round((frames * 1000) / ms) };
+    };
+  }, [gl, advance, clock]);
   return null;
 }
 

@@ -4,6 +4,8 @@ import {
   instanceIndex,
   mix,
   mrt,
+  output,
+  vec4,
   normalLocal,
   normalView,
   positionLocal,
@@ -217,10 +219,15 @@ export class BoltPool {
   private readonly coneGeometry = new THREE.ConeGeometry(1, 1, 24, 1, true);
   // Every cone in one instanced draw: glowing, added on top, brightest at
   // the apex and fading to nothing at the open end. Each fades on its own
-  // through its instance colour
+  // through its instance colour. Its colour is added, and its alpha zeroes
+  // what's behind, flagging it for the selective bloom pass
   private readonly coneMaterial = new THREE.MeshBasicNodeMaterial({
     transparent: true,
-    blending: THREE.AdditiveBlending,
+    blending: THREE.CustomBlending,
+    blendSrc: THREE.OneFactor,
+    blendDst: THREE.OneFactor,
+    blendSrcAlpha: THREE.ZeroFactor,
+    blendDstAlpha: THREE.OneMinusSrcAlphaFactor,
     depthWrite: false,
     side: THREE.DoubleSide,
   });
@@ -230,9 +237,9 @@ export class BoltPool {
 
   constructor(stains: Stains) {
     // Over-bright so it stays saturated deep red after tone mapping, and
-    // flagged for the selective bloom pass
+    // flagged for the selective bloom pass by a zero alpha
     this.material.colorNode = vec3(3.0, 0.08, 0.05);
-    this.material.mrtNode = mrt({ bloomIntensity: float(1.0) });
+    this.material.mrtNode = mrt({ output: vec4(output.rgb, 0.0) });
 
     // Apex at the origin, opening along +y, so it scales to length and width
     this.coneGeometry.rotateX(Math.PI);
@@ -258,7 +265,6 @@ export class BoltPool {
       .mul(pow(uv().y, 2.2))
       .mul(mix(0.2, 1.0, jets))
       .mul(reached);
-    this.coneMaterial.mrtNode = mrt({ bloomIntensity: float(1.0) });
     this.cones = new THREE.InstancedMesh(this.coneGeometry, this.coneMaterial, POOL_SIZE);
     this.cones.frustumCulled = false;
 

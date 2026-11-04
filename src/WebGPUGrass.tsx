@@ -37,8 +37,10 @@ import {
   If,
   ivec2,
   uint,
+  Loop,
+  positionViewDirection,
 } from "three/tsl";
-import { ISO_ELEVATION, ISO_RIGHT, ISO_UP, ISO_VIEW_HEIGHT } from "./iso";
+import { ISO_ELEVATION, ISO_OFFSET, ISO_RIGHT, ISO_UP, ISO_VIEW_HEIGHT } from "./iso";
 import { hash12, hash22, noise } from "./tslNoise";
 import { bareGround } from "./worldMap";
 import { MAX_DENTS, MAX_STAINS, type Stains } from "./stains";
@@ -66,6 +68,8 @@ const MAX_PUSHERS = 6;
 const NOWHERE = 1e6;
 // Reach of a stain slot with nothing to paint
 const NOT_PAINTING = -1e3;
+// Most point lights the grass lights itself with (the bolts' are 14)
+const MAX_GRASS_LIGHTS = 16;
 
 // Blades lean past the edges of their footprint by up to this much: wind
 // (~1.4 m at full gust on soft blades), trail push (up to TRAIL_PUSH m) and rest bend
@@ -75,6 +79,33 @@ const BEND_MARGIN = 3.0;
 const viewRight = vec2(...ISO_RIGHT);
 const viewUp = vec2(...ISO_UP);
 const towardCamera = viewUp.negate();
+// World direction towards the camera
+const toCamera = vec3(...ISO_OFFSET).normalize();
+
+// Face normal of a bent blade at height uvY: the cross of its x axis with
+// the tangent up the blade (the derivative of the bent position with
+// respect to uv.y)
+function bladeNormal(
+  axis: THREE.Node<"vec2">,
+  restBend: THREE.Node<"vec2">,
+  linearBend: THREE.Node<"vec2">,
+  droop: THREE.Node<"float">,
+  height: THREE.Node<"float">,
+  uvY: THREE.Node<"float">
+) {
+  const tangentXZ = restBend.mul(uvY.mul(2.0)).add(linearBend);
+  const tangentY = height
+    .mul(0.6)
+    .sub(dot(restBend, restBend).mul(pow(uvY, 4.0)))
+    .sub(droop.mul(3.0).mul(uvY.mul(uvY)));
+  return normalize(
+    vec3(
+      axis.y.mul(tangentY).negate(),
+      axis.y.mul(tangentXZ.x).sub(axis.x.mul(tangentXZ.y)),
+      axis.x.mul(tangentY)
+    )
+  );
+}
 
 function createBladeGeometry(bladeCount: number) {
   const width = 0.1;
@@ -125,7 +156,11 @@ function createBladeGeometry(bladeCount: number) {
   return geom;
 }
 
-function createGrass(bladeCount: number, stains: Stains) {
+// With bladeLit, the grass lights itself instead of using three's lights:
+// the point lights once per blade, at its root and tip, in the update
+// compute, and the sun and ambient light per pixel. Only the chosen path
+// is built into the shaders
+function createGrass(bladeCount: number, stains: Stains, bladeLit: boolean) {
   const uniforms = {
     time: uniform(0),
     // Bottom-left cell of the slot grid in the view's ground grid, its
@@ -146,7 +181,23 @@ function createGrass(bladeCount: number, stains: Stains) {
     translucency: uniform(0),
     wetness: uniform(0),
     specular: uniform(new THREE.Color(0x000000)),
+    shininess: uniform(30),
     ridge: uniform(0.6),
+    // The scene's lights, mirrored for bladeLit: colours scaled by
+    // intensity, the sun's direction in view space, and each point light's
+    // position and range, colour and decay
+    ambient: uniform(new THREE.Color(0x000000)),
+    sunColor: uniform(new THREE.Color(0x000000)),
+    sunView: uniform(new THREE.Vector3(0, 1, 0)),
+    lightCount: uniform(0, "int"),
+    lightPositions: uniformArray(
+      Array.from({ length: MAX_GRASS_LIGHTS }, () => new THREE.Vector4()),
+      "vec4"
+    ),
+    lightColors: uniformArray(
+      Array.from({ length: MAX_GRASS_LIGHTS }, () => new THREE.Vector4()),
+      "vec4"
+    ),
     // Blood splats spreading this frame: x, z, radius, throw angle (the
     // Stains' own vectors), and how far each has spread, or NOT_PAINTING
     stains: uniformArray(stains.spots, "vec4"),
@@ -161,7 +212,13 @@ function createGrass(bladeCount: number, stains: Stains) {
   // Uniform arrays only upload once per render by default, after this
   // frame's compute has already run on stale values; these must upload on
   // every dispatch
-  for (const array of [uniforms.stains, uniforms.stainReach, uniforms.dents]) {
+  for (const array of [
+    uniforms.stains,
+    uniforms.stainReach,
+    uniforms.dents,
+    uniforms.lightPositions,
+    uniforms.lightColors,
+  ]) {
     array.updateType = THREE.NodeUpdateType.OBJECT;
   }
 
@@ -339,6 +396,49 @@ function createGrass(bladeCount: number, stains: Stains) {
   const bladeXform = instancedArray(bladeCount, "vec4"); // posX, posZ, scaled blade x axis
   const bladeBend = instancedArray(bladeCount, "vec4"); // linear bend.xz, cubic droop, height
   const bladeLook = instancedArray(bladeCount, "vec4"); // restBend.xz, colorVar + dryness, shade + blood
+  // Point light irradiance at the root and tip, and the specular highlight
+  // it makes as a fraction of it (bladeLit only)
+  const bladeLightRoot = bladeLit ? instancedArray(bladeCount, "vec4") : null;
+  const bladeLightTip = bladeLit ? instancedArray(bladeCount, "vec4") : null;
+
+  // Light from the point lights reaching a world position on a surface
+  // facing n, as three works it out (inverse power falloff, eased to zero
+  // at the light's range). Its Blinn-Phong highlight goes in w, as a
+  // fraction of the light: the fraction of a single light's, and close
+  // enough for a few lights of similar colour. Fresnel's brightening at
+  // grazing angles is left out
+  const pointLight = Fn(([position, n]: [THREE.Node<"vec3">, THREE.Node<"vec3">]) => {
+    const sum = vec3(0.0).toVar();
+    const highlights = float(0.0).toVar();
+    const brightness = float(0.0).toVar();
+    Loop(uniforms.lightCount, ({ i }) => {
+      const light = uniforms.lightPositions.element(i);
+      const color = uniforms.lightColors.element(i);
+      const toLight = light.xyz.sub(position);
+      const distance = length(toLight).toVar();
+      const falloff = pow(distance, color.w)
+        .max(0.01)
+        .reciprocal()
+        .mul(pow(saturate(pow(distance.div(light.w), 4.0).oneMinus()), 2.0));
+      const direction = toLight.div(distance).toVar();
+      const irradiance = color.xyz.mul(saturate(dot(n, direction)).mul(falloff)).toVar();
+      sum.addAssign(irradiance);
+
+      const half = direction.add(toCamera).normalize();
+      const dotVH = saturate(dot(toCamera, half));
+      const fresnel = dotVH.mul(-5.55473).sub(6.98316).mul(dotVH).exp2();
+      const highlight = uniforms.shininess
+        .mul(0.5)
+        .add(1.0)
+        .mul(0.25 / Math.PI)
+        .mul(pow(saturate(dot(n, half)), uniforms.shininess))
+        .mul(fresnel.oneMinus());
+      const amount = irradiance.x.add(irradiance.y).add(irradiance.z);
+      highlights.addAssign(highlight.mul(amount));
+      brightness.addAssign(amount);
+    });
+    return vec4(sum, highlights.div(brightness.max(1e-6)));
+  });
 
   // Everything that only depends on the blade (not the vertex) is computed
   // once per blade here, instead of once per vertex in the vertex shader
@@ -436,6 +536,20 @@ function createGrass(bladeCount: number, stains: Stains) {
     const distanceToSphere = length(grassPos.sub(uniforms.spherePosition.xz));
     const shadowStrength = smoothstep(0.0, 2.0, distanceToSphere).oneMinus().mul(0.8);
 
+    if (bladeLightRoot && bladeLightTip) {
+      // Lit on the side the camera sees
+      const axis = vec2(cosRot, sinRot);
+      const litAt = (uvY: number, position: THREE.Node<"vec3">) => {
+        const n = bladeNormal(axis, restBend, linearBend, droop, heightVar, float(uvY)).toVar();
+        const seen = n.mul(select(dot(n, toCamera).lessThan(0.0), -1.0, 1.0));
+        return pointLight(position, seen);
+      };
+      const tipXZ = grassPos.add(restBend).add(linearBend);
+      const tipY = heightVar.mul(0.6).sub(dot(restBend, restBend).mul(0.2).add(droop));
+      bladeLightRoot.element(instanceIndex).assign(litAt(0, vec3(grassPos.x, 0.0, grassPos.y)));
+      bladeLightTip.element(instanceIndex).assign(litAt(1, vec3(tipXZ.x, tipY, tipXZ.y)));
+    }
+
     bladeXform.element(instanceIndex).assign(vec4(grassPos, xAxis));
     bladeBend
       .element(instanceIndex)
@@ -512,21 +626,8 @@ function createGrass(bladeCount: number, stains: Stains) {
 
   const axis = normalize(xform.zw);
 
-  // Face normal follows the bend: cross of the blade x axis with the tangent
-  // up the blade (derivative of the bent position with respect to uv.y)
-  const restBend = look.xy;
-  const tangentXZ = restBend.mul(uvY.mul(2.0)).add(bend.xy);
-  const tangentY = bend.w
-    .mul(0.6)
-    .sub(dot(restBend, restBend).mul(pow(uvY, 4.0)))
-    .sub(bend.z.mul(3.0).mul(uvY.mul(uvY)));
-  const faceNormal = normalize(
-    vec3(
-      axis.y.mul(tangentY).negate(),
-      axis.y.mul(tangentXZ.x).sub(axis.x.mul(tangentXZ.y)),
-      axis.x.mul(tangentY)
-    )
-  );
+  // Face normal follows the bend
+  const faceNormal = bladeNormal(axis, look.xy, bend.xy, bend.z, bend.w, uvY);
 
   // Normal tilts across the blade, blended from a round profile to a
   // V-shaped midrib ridge. Done per fragment since the blade has no centre
@@ -561,18 +662,51 @@ function createGrass(bladeCount: number, stains: Stains) {
     return glowColor.mul(glow).mul(uniforms.translucency);
   })();
 
-  const material = new THREE.MeshPhongNodeMaterial({ side: THREE.DoubleSide });
-  material.positionNode = position;
-  material.colorNode = varying(color);
-  material.normalNode = normal;
-  material.emissiveNode = backlight;
   // Fake AO: speculars strongest at the tips, fading into the dense base.
   // Wet blades shine further down
-  material.specularNode = uniforms.specular.mul(
-    smoothstep(uniforms.wetness.mul(-0.6), 1.0, uvY)
-  );
+  const specular = uniforms.specular.mul(smoothstep(uniforms.wetness.mul(-0.6), 1.0, uvY));
 
-  const buffers = [bladeXform, bladeBend, bladeLook];
+  let material: THREE.NodeMaterial;
+  if (bladeLightRoot && bladeLightTip) {
+    // The same Phong maths three would do. The blade's point light, blended
+    // up from root to tip in the vertex shader
+    const point = varying(mix(bladeLightRoot.toAttribute(), bladeLightTip.toAttribute(), uvY));
+    // The sun per pixel, so it still picks out the ridge
+    const sunNL = saturate(dot(normal, uniforms.sunView));
+    const sunLight = sunNL.mul(uniforms.sunColor);
+    const half = uniforms.sunView.add(positionViewDirection).normalize();
+    const dotNH = saturate(dot(normal, half));
+    const dotVH = saturate(dot(positionViewDirection, half));
+    const fresnel = dotVH.mul(-5.55473).sub(6.98316).mul(dotVH).exp2();
+    const reflectance = vec3(specular).mul(fresnel.oneMinus()).add(fresnel);
+    const highlight = uniforms.shininess
+      .mul(0.5)
+      .add(1.0)
+      .mul(1 / Math.PI)
+      .mul(pow(dotNH, uniforms.shininess));
+    const diffuse = varying(color)
+      .mul(point.xyz.add(sunLight).add(uniforms.ambient))
+      .mul(1 / Math.PI);
+
+    const basic = new THREE.MeshBasicNodeMaterial({ side: THREE.DoubleSide });
+    basic.lights = false;
+    basic.colorNode = diffuse
+      .add(sunLight.mul(reflectance).mul(highlight).mul(0.25))
+      .add(point.xyz.mul(specular).mul(point.w))
+      .add(backlight);
+    material = basic;
+  } else {
+    const phong = new THREE.MeshPhongNodeMaterial({ side: THREE.DoubleSide });
+    phong.colorNode = varying(color);
+    phong.normalNode = normal;
+    phong.emissiveNode = backlight;
+    phong.specularNode = specular;
+    phong.shininessNode = uniforms.shininess;
+    material = phong;
+  }
+  material.positionNode = position;
+
+  const buffers = [bladeXform, bladeBend, bladeLook, bladeLightRoot, bladeLightTip];
 
   return {
     uniforms,
@@ -584,7 +718,7 @@ function createGrass(bladeCount: number, stains: Stains) {
     material,
     dispose: () => {
       material.dispose();
-      for (const buffer of [...buffers, trailMap, bloodMap]) buffer.value.dispose?.();
+      for (const buffer of [...buffers, trailMap, bloodMap]) buffer?.value.dispose?.();
     },
   };
 }
@@ -601,6 +735,54 @@ export type GrassLook = {
 };
 
 const viewDirection = new THREE.Vector3();
+const lightColor = new THREE.Color();
+const lightPosition = new THREE.Vector3();
+const targetPosition = new THREE.Vector3();
+
+// Copies the scene's visible lights into the grass's own: the ambient
+// lights summed, one directional light (the sun or moon) and the first
+// MAX_GRASS_LIGHTS point lights
+function mirrorLights(
+  scene: THREE.Scene,
+  camera: THREE.Camera,
+  uniforms: ReturnType<typeof createGrass>["uniforms"]
+) {
+  uniforms.ambient.value.setRGB(0, 0, 0);
+  uniforms.sunColor.value.setRGB(0, 0, 0);
+  let count = 0;
+  scene.traverseVisible((object) => {
+    const light = object as THREE.Light;
+    if (!light.isLight) return;
+    lightColor.copy(light.color).multiplyScalar(light.intensity);
+    if ((light as THREE.AmbientLight).isAmbientLight) {
+      uniforms.ambient.value.add(lightColor);
+    } else if ((light as THREE.DirectionalLight).isDirectionalLight) {
+      const sun = light as THREE.DirectionalLight;
+      sun.updateWorldMatrix(true, false);
+      sun.target.updateWorldMatrix(true, false);
+      lightPosition.setFromMatrixPosition(sun.matrixWorld);
+      targetPosition.setFromMatrixPosition(sun.target.matrixWorld);
+      uniforms.sunColor.value.copy(lightColor);
+      uniforms.sunView.value
+        .subVectors(lightPosition, targetPosition)
+        .transformDirection(camera.matrixWorldInverse);
+    } else if ((light as THREE.PointLight).isPointLight && count < MAX_GRASS_LIGHTS) {
+      const point = light as THREE.PointLight;
+      point.updateWorldMatrix(true, false);
+      lightPosition.setFromMatrixPosition(point.matrixWorld);
+      // A range of 0 means endless
+      uniforms.lightPositions.array[count].set(
+        lightPosition.x,
+        lightPosition.y,
+        lightPosition.z,
+        point.distance || 1e9
+      );
+      uniforms.lightColors.array[count].set(lightColor.r, lightColor.g, lightColor.b, point.decay);
+      count++;
+    }
+  });
+  uniforms.lightCount.value = count;
+}
 
 export default function WebGPUGrass({
   spherePosition,
@@ -627,12 +809,16 @@ export default function WebGPUGrass({
     "Wind Speed": windSpeedLeva,
     "Trail Recovery": trailRecovery,
     "Blade Ridge": bladeRidge,
+    "Blade Lighting": bladeLit,
   } = useControls("🌿 Grass Field", {
     Density: { value: 60, min: 10, max: 200, step: 5 },
     "Blade Height": { value: 1.3, min: 0.7, max: 4.0, step: 0.1 },
     "Wind Speed": { value: 1.3, min: 0.0, max: 5.0, step: 0.1 },
     "Trail Recovery": { value: 3.0, min: 0.2, max: 20.0, step: 0.1 },
     "Blade Ridge": { value: 0.6, min: 0.0, max: 1.0, step: 0.05 },
+    // Lights the grass itself, point lights once per blade, instead of with
+    // three's per pixel lights. ?light=three starts with three's
+    "Blade Lighting": new URLSearchParams(location.search).get("light") !== "three",
   });
 
   // Slot grid covering the ground the fixed iso view sees, in the view's
@@ -654,7 +840,10 @@ export default function WebGPUGrass({
   const bladeCount = grid.columns * grid.rows;
 
   const geometry = useMemo(() => createBladeGeometry(bladeCount), [bladeCount]);
-  const grass = useMemo(() => createGrass(bladeCount, stains), [bladeCount, stains]);
+  const grass = useMemo(
+    () => createGrass(bladeCount, stains, bladeLit),
+    [bladeCount, stains, bladeLit]
+  );
 
   useEffect(() => () => geometry.dispose(), [geometry]);
   useEffect(() => () => grass.dispose(), [grass]);
@@ -679,7 +868,7 @@ export default function WebGPUGrass({
 
   useEffect(() => {
     grass.uniforms.specular.value.set(look.specular);
-    grass.material.shininess = look.shininess;
+    grass.uniforms.shininess.value = look.shininess;
     grass.uniforms.tipTint.value.fromArray(look.tipTint);
     grass.uniforms.translucency.value = look.translucency;
     grass.uniforms.wetness.value = look.wetness;
@@ -689,6 +878,7 @@ export default function WebGPUGrass({
   useFrame((state, delta) => {
     const { uniforms } = grass;
     uniforms.time.value = state.clock.elapsedTime;
+    if (bladeLit) mirrorLights(state.scene, state.camera, uniforms);
 
     // Ground point at the centre of the screen, in view ground axes
     const { camera } = state;
@@ -750,10 +940,14 @@ export default function WebGPUGrass({
   });
 
   return (
+    // Drawn before the ground it covers, so GPUs that only skip hidden
+    // pixels behind what's already drawn (all but Apple's) skip shading the
+    // ground beneath. Its slots already run from the camera outwards
     <mesh
       geometry={geometry}
       material={grass.material}
       frustumCulled={false}
+      renderOrder={-1}
     />
   );
 }
