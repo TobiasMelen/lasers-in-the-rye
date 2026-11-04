@@ -35,6 +35,8 @@ import {
   saturate,
   uniformArray,
   If,
+  ivec2,
+  uint,
 } from "three/tsl";
 import { ISO_ELEVATION, ISO_RIGHT, ISO_UP, ISO_VIEW_HEIGHT } from "./iso";
 import { hash12, hash22, noise } from "./tslNoise";
@@ -343,12 +345,14 @@ function createGrass(bladeCount: number, stains: Stains) {
   const update = Fn(() => {
     // Each slot covers one cell of a world-locked grid along the view's
     // ground axes. The slot grid follows the camera, and every blade
-    // property hashes from the cell, so blades stay put as it scrolls
-    const idx = float(instanceIndex);
-    const row = floor(idx.add(0.5).div(uniforms.gridWidth));
-    const cell = uniforms.gridOrigin
-      .add(vec2(idx.sub(row.mul(uniforms.gridWidth)), row))
-      .toVar();
+    // property hashes from the cell, so blades stay put as it scrolls. The
+    // cell is worked out in integers: in floats, the GPU's fast maths can
+    // round a cell's values a hair differently from slot to slot, which
+    // flips blades sitting right at a path's cull threshold as they move
+    // between slots
+    const width = uint(uniforms.gridWidth);
+    const slot = ivec2(int(instanceIndex.mod(width)), int(instanceIndex.div(width)));
+    const cell = vec2(ivec2(uniforms.gridOrigin).add(slot)).toVar();
     const local = cell.add(hash22(cell)).mul(uniforms.cellSize);
     const grassPos = viewRight.mul(local.x).add(viewUp.mul(local.y)).toVar();
 
