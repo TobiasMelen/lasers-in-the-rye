@@ -31,7 +31,10 @@ import { bloom } from "three/examples/jsm/tsl/display/BloomNode.js";
 // highlights reach HDR displays. On an HDR canvas all of it is kept, and
 // the bolts and sparks (whatever blooms) get hdrBoost times their brightest
 // channel on top again, tinted HDR_CORE: an orange, white-hot core inside
-// their red glow. hdrBoost is a setting, changed live
+// their red glow. hdrBoost is a setting, changed live. The glow also
+// counts GLOW_PER_BOOST times hdrBoost over there, so its brighter
+// fall-off rises past white with the cores, while the rest of the scene
+// stays as it is
 export const TONE_MAPPINGS = {
   "ACES Filmic": acesFilmicToneMapping,
   AgX: agxToneMapping,
@@ -43,6 +46,7 @@ export const TONE_MAPPINGS = {
 };
 const HIGHLIGHT_KEEP = 0.6;
 const HDR_HIGHLIGHT_KEEP = 1.0;
+const GLOW_PER_BOOST = 0.15;
 export const hdrBoost = uniform(8.0);
 const HDR_CORE = [1.0, 0.4, 0.12] as const;
 // Glow strength and spread (0 to 1), more of both on an HDR canvas, which
@@ -94,7 +98,7 @@ export function createPost(
   const hdr = mix(contrasted, base, mask).add(glow.rgb);
   const curve = TONE_MAPPINGS[toneMapping as keyof typeof TONE_MAPPINGS] ?? acesFilmicToneMapping;
   const filmic = curve(hdr, float(1.0));
-  const over = max(hdr.sub(1.0), 0.0);
+  const over = max((hdrOutput ? hdr.add(glow.rgb.mul(hdrBoost.mul(GLOW_PER_BOOST))) : hdr).sub(1.0), 0.0);
   const whiteHot = vec3(max(base.r, max(base.g, base.b))).mul(mask).mul(vec3(...HDR_CORE));
   const highlights = vec3(
     hdrOutput ? over.mul(HDR_HIGHLIGHT_KEEP).add(whiteHot.mul(hdrBoost)) : over.mul(HIGHLIGHT_KEEP)

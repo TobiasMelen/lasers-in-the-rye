@@ -201,7 +201,7 @@ graphicsGui.add(settings, "msaa").name("MSAA 4x").onChange(rebuildPost);
 graphicsGui.add(settings, "fps", { "60": 60, Display: 0 }).name("Frame rate cap");
 graphicsGui.add(settings, "toneMapping", Object.keys(TONE_MAPPINGS)).name("Tone Mapping").onChange(rebuildPost);
 graphicsGui.add(settings, "hdr").name("HDR").disable(!hdrScreen).onChange(setOutput);
-// How bright the bolts' cores burn past white, on HDR only
+// How bright the bolts' cores, and their glow, burn past white, on HDR only
 const boostControl = graphicsGui
   .add(settings, "hdrBoost", 0, 16, 0.5)
   .name("HDR Boost")
