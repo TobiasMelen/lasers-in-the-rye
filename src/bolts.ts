@@ -1,8 +1,10 @@
 import * as THREE from "three/webgpu";
 import {
-  float,
-  instanceIndex,
-  mix,
+  Discard,
+  Fn,
+  If,
+  length,
+  max,
   mrt,
   output,
   vec4,
@@ -12,9 +14,8 @@ import {
   pow,
   saturate,
   sin,
-  smoothstep,
-  time,
-  uv,
+  uniform,
+  varying,
   vec3,
 } from "three/tsl";
 import { Debris, type DebrisStyle } from "./debris";
@@ -23,8 +24,8 @@ import type { Stains } from "./stains";
 // Red laser bolts, shared by everyone who shoots. Each flies level from
 // where it was fired and ends on the first target of another team it
 // passes through, or after BOLT_LIFE. A hit on something that explodes
-// slams the bolt flat into a flying disc and flashes its light, with a
-// cone of fire, sparks and blood blown on the way the bolt was going
+// flashes its light, and the bolt splats against it, with sparks and blood
+// blown on the way the bolt was going
 
 const BOLT_SPEED = 70; // metres per second
 const BOLT_LIFE = 0.7; // seconds
@@ -49,43 +50,36 @@ const LIGHT_RANGE = 10;
 const MUZZLE_FLASH = 4;
 
 // The burst on an exploding hit: the light flashes and dies over
-// BURST_TIME. The bolt itself slams flat like it hit a wall, squashing into
-// a wide thin disc across its path, a nail's head, which keeps flying on at
-// the bolt's speed, spreading wider as it thins away to nothing
+// BURST_TIME. The bolt keeps flowing into the impact, slowed, and splats:
+// whatever reaches the impact squashes outwards into a cone splashing back
+// the way it came, and is gone once it has spread SPLAT_REACH
 const BURST_TIME = 0.25; // seconds
-const BURST_LIGHT = 240; // light intensity at the flash
+const BURST_LIGHT = 380; // light intensity at the flash
 const BURST_LIGHT_RANGE = 16;
-const HEAD_SLAM = 0.03; // seconds to squash flat
-const HEAD_FADE = 0.16; // seconds until it's gone
-const HEAD_RADIUS = 1.1; // metres across once flat
-const HEAD_SPREAD = 1.8; // times wider by the time it's gone
-const HEAD_THICKNESS = 0.22; // metres along its path once flat
-
-// Cone of fire opening from the impact along the bolt's way, shooting out
-// to full length fast and fading from its tip back
-// Each burst's cone is a random size up to these, and tipped a little off
-// the bolt's line
-const CONE_LENGTH = 4; // metres
-const CONE_RADIUS = 1.5; // metres at its open end
-const CONE_MIN_SIZE = 0.5; // smallest, as a fraction of the full size
-const CONE_JITTER = 0.18; // radians, either way
-const CONE_TIME = 0.12; // seconds
+const SPLAT_SPEED = 40; // metres per second, flowing into the impact
+const SPLAT_SPREAD = 0.4; // metres outwards per metre that has flowed in
+const SPLAT_BACK = 0.12; // metres back per metre that has flowed in
+const SPLAT_REACH = 0.6; // metres flowed in before it's gone
+// Where the bolt's mesh is cut while flying: nowhere
+const UNCUT = 1e6;
 
 // Sparks: hot streaks blown on in a cone along the bolt's way, slowing and
 // falling
 const SPARKS: DebrisStyle = {
-  pool: 320,
-  perBurst: 64,
+  pool: 330,
+  perBurst: 70,
   life: [0.3, 0.65],
-  speed: [10, 24],
+  speed: [11, 23],
   carry: 2.6,
-  fan: 0.45,
+  fan: 1.9,
   lift: 0.1,
   gravity: 22,
-  drag: 1.2,
-  width: 0.08,
+  drag: 1.6,
+  width: 0.18,
   stretch: 0.065,
   shrink: 1,
+  // From all over the splat rather than one point
+  body: { radius: 0.3, below: 0.15 },
 };
 
 // Blood: dark, chunky blobs thrown on the same way, heavier and slower,
@@ -127,7 +121,7 @@ function teardrop() {
 }
 
 // Opacity at the middle of a blood mist puff
-const MIST_OPACITY = 0.19;
+const MIST_OPACITY = 0.26;
 
 // How far blood blobs' surfaces bulge in and out as they fly, in metres
 const BLOOD_WOBBLE = 0.07;
@@ -139,8 +133,8 @@ const DENT_SIZE = 2.2;
 // rolls out the bolt's way over the splatter as that spreads, slowing as
 // it goes, and thins out
 const MIST: DebrisStyle = {
-  pool: 48,
-  perBurst: 8,
+  pool: 84,
+  perBurst: 14,
   life: [0.9, 1.4],
   speed: [8, 16],
   carry: 3,
@@ -148,10 +142,11 @@ const MIST: DebrisStyle = {
   lift: 0.15,
   gravity: 1,
   drag: 2,
-  width: 1.3,
+  // Starts out big and peaks early, so it bursts in rather than swells
+  width: 1.6,
   variety: 0.4,
   stretch: 0,
-  shrink: 0.6,
+  shrink: 1,
   grow: 2.5,
   body: { radius: 0.3, below: 0.7 },
 };
@@ -174,13 +169,10 @@ type Bolt = {
   team: Team;
   origin: THREE.Vector3;
   direction: THREE.Vector3;
-  head: number; // distance of the front end from the origin
+  // Distance of the front end from the origin; once burst, from the impact
+  head: number;
   age: number;
   burst: number; // time since it burst, or -1 while flying
-  index: number; // its instance in the cone mesh
-  coneRotation: THREE.Quaternion;
-  coneLength: number;
-  coneRadius: number;
 };
 
 
@@ -188,19 +180,18 @@ type Bolt = {
 const yAxis = new THREE.Vector3(0, 1, 0);
 const toTarget = new THREE.Vector2();
 const impact = new THREE.Vector3();
-const coneAxis = new THREE.Vector3();
-const coneMatrix = new THREE.Matrix4();
-const coneScale = new THREE.Vector3();
-const coneGlow = new THREE.Color();
-const hidden = new THREE.Matrix4().makeScale(0, 0, 0);
 
 export class BoltPool {
   readonly group = new THREE.Group();
   readonly targets = new Set<Target>();
   private readonly bolts: Bolt[] = [];
-  private readonly geometry = new THREE.CapsuleGeometry(BOLT_RADIUS, BOLT_LENGTH, 4, 8);
+  // Enough rows along it for the splat to bend it smoothly
+  private readonly geometry = new THREE.CapsuleGeometry(BOLT_RADIUS, BOLT_LENGTH, 4, 8, 40);
   private readonly material = new THREE.MeshBasicNodeMaterial();
+  // Seen from inside too, once it splats
+  private readonly boltMaterial = new THREE.MeshBasicNodeMaterial({ side: THREE.DoubleSide });
   private next = 0;
+  private readonly time = uniform(0);
   private readonly sparkGeometry = new THREE.BoxGeometry(1, 1, 1);
   private readonly bloodGeometry = teardrop();
   private readonly bloodMaterial = new THREE.MeshBasicNodeMaterial({
@@ -216,68 +207,43 @@ export class BoltPool {
     depthWrite: false,
   });
   private readonly mist: Debris;
-  private readonly coneGeometry = new THREE.ConeGeometry(1, 1, 24, 1, true);
-  // Every cone in one instanced draw: glowing, added on top, brightest at
-  // the apex and fading to nothing at the open end. Each fades on its own
-  // through its instance colour. Its colour is added, and its alpha zeroes
-  // what's behind, flagging it for the selective bloom pass
-  private readonly coneMaterial = new THREE.MeshBasicNodeMaterial({
-    transparent: true,
-    blending: THREE.CustomBlending,
-    blendSrc: THREE.OneFactor,
-    blendDst: THREE.OneFactor,
-    blendSrcAlpha: THREE.ZeroFactor,
-    blendDstAlpha: THREE.OneMinusSrcAlphaFactor,
-    depthWrite: false,
-    side: THREE.DoubleSide,
-  });
-  private readonly cones: THREE.InstancedMesh;
   private readonly sparks: Debris;
   private readonly blood: Debris;
 
   constructor(stains: Stains) {
     // Over-bright so it stays saturated deep red after tone mapping, and
     // flagged for the selective bloom pass by a zero alpha
-    this.material.colorNode = vec3(3.0, 0.08, 0.05);
+    this.material.colorNode = vec3(4.5, 0.12, 0.075);
     this.material.mrtNode = mrt({ output: vec4(output.rgb, 0.0) });
 
-    // Apex at the origin, opening along +y, so it scales to length and width
-    this.coneGeometry.rotateX(Math.PI);
-    this.coneGeometry.translate(0, 0.5, 0);
-    // Broken into ragged jets of fire rather than an even sheet: brightness
-    // and reach vary around it, in a pattern that churns over time and
-    // differs per cone. Whole waves around, so there's no seam
-    const around = uv().x.mul(Math.PI * 2);
-    const churn = time.mul(9.0).add(float(instanceIndex).mul(2.7));
-    const jets = saturate(
-      sin(around.mul(5.0).add(churn))
-        .mul(sin(around.mul(8.0).sub(churn.mul(1.3))))
-        .add(sin(around.mul(3.0).add(churn.mul(0.7))).mul(0.5))
-        .mul(0.6)
-        .add(0.5)
+    // The splat, in the bolt's own space (along y, front at +y): past each
+    // bolt's cut, the impact, it folds back and spreads out, and is dropped
+    // once it has flowed in SPLAT_REACH
+    const cutAt = uniform(UNCUT).onObjectUpdate(({ object }) => object!.userData.cut);
+    const flowed = max(positionLocal.y.sub(cutAt), 0.0);
+    const across = length(positionLocal.xz);
+    const spread = across.add(flowed.mul(SPLAT_SPREAD)).div(max(across, 1e-4));
+    this.boltMaterial.positionNode = vec3(
+      positionLocal.x.mul(spread),
+      positionLocal.y.min(cutAt).sub(flowed.mul(SPLAT_BACK)),
+      positionLocal.z.mul(spread)
     );
-    const jetReach = sin(around.mul(7.0).sub(churn.mul(0.8)))
-      .mul(sin(around.mul(4.0).add(churn.mul(1.6))))
-      .mul(0.3)
-      .add(0.7);
-    const reached = smoothstep(jetReach, jetReach.sub(0.2), uv().y.oneMinus());
-    this.coneMaterial.colorNode = vec3(3.0, 0.09, 0.05)
-      .mul(pow(uv().y, 2.2))
-      .mul(mix(0.2, 1.0, jets))
-      .mul(reached);
-    this.cones = new THREE.InstancedMesh(this.coneGeometry, this.coneMaterial, POOL_SIZE);
-    this.cones.frustumCulled = false;
+    const gone = varying(flowed).greaterThan(SPLAT_REACH);
+    this.boltMaterial.colorNode = Fn(() => {
+      If(gone, () => Discard());
+      return this.material.colorNode!;
+    })();
+    this.boltMaterial.mrtNode = this.material.mrtNode;
 
     for (let i = 0; i < POOL_SIZE; i++) {
-      const mesh = new THREE.Mesh(this.geometry, this.material);
+      const mesh = new THREE.Mesh(this.geometry, this.boltMaterial);
       mesh.visible = false;
       mesh.frustumCulled = false;
+      mesh.userData.cut = UNCUT;
       const light = new THREE.PointLight(LIGHT_COLOR, 0, LIGHT_RANGE, 2);
       light.visible = false;
 
       this.group.add(mesh, light);
-      this.cones.setMatrixAt(i, hidden);
-      this.cones.setColorAt(i, coneGlow.setScalar(0));
       this.bolts.push({
         mesh,
         light,
@@ -287,16 +253,14 @@ export class BoltPool {
         head: 0,
         age: BOLT_LIFE,
         burst: -1,
-        index: i,
-        coneRotation: new THREE.Quaternion(),
-        coneLength: CONE_LENGTH,
-        coneRadius: CONE_RADIUS,
       });
     }
 
     // Gooey wobble: the surface bulges in and out with ripples that drift
-    // through space, so blobs churn as they fly. The material sees each blob
+    // through space, so blobs churn as they fly, on the pool's own clock,
+    // which stops while the game is paused. The material sees each blob
     // already placed, so this works in world space, along its normals
+    const time = this.time;
     const ripple = sin(positionLocal.x.mul(9.0).add(time.mul(14.0)))
       .mul(sin(positionLocal.y.mul(8.0).sub(time.mul(11.0))))
       .mul(sin(positionLocal.z.mul(7.0).add(time.mul(13.0))));
@@ -311,7 +275,7 @@ export class BoltPool {
       stains.dent(position.x, position.z, width * DENT_SIZE)
     );
     this.mist = new Debris(MIST, this.mistGeometry, this.mistMaterial);
-    this.group.add(this.cones, this.sparks.mesh, this.blood.mesh, this.mist.mesh);
+    this.group.add(this.sparks.mesh, this.blood.mesh, this.mist.mesh);
   }
 
   // Fire from a muzzle along a level direction, reusing the oldest bolt
@@ -319,7 +283,6 @@ export class BoltPool {
     const bolt = this.bolts[this.next];
     this.next = (this.next + 1) % this.bolts.length;
     bolt.team = team;
-    if (bolt.burst >= 0) this.hideCone(bolt);
     bolt.age = 0;
     bolt.head = 0;
     bolt.burst = -1;
@@ -328,10 +291,12 @@ export class BoltPool {
     bolt.origin.copy(muzzle);
     bolt.direction.copy(direction).setY(0).normalize();
     bolt.mesh.quaternion.setFromUnitVectors(yAxis, bolt.direction);
+    bolt.mesh.userData.cut = UNCUT;
     bolt.mesh.visible = true;
   }
 
   update(delta: number) {
+    this.time.value += delta;
     for (const bolt of this.bolts) {
       if (bolt.burst >= 0) {
         this.updateBurst(bolt, delta);
@@ -356,7 +321,7 @@ export class BoltPool {
       const target = this.sweep(bolt, bolt.head, head);
       if (target) {
         target.hit(bolt.direction);
-        if (target.explodes) this.explode(bolt, target);
+        if (target.explodes) this.explode(bolt, target, head);
         else this.end(bolt);
         continue;
       }
@@ -373,70 +338,42 @@ export class BoltPool {
     this.mist.update(delta);
   }
 
-  // Turn the bolt into a burst where it met the target
-  private explode(bolt: Bolt, target: Target) {
+  // Turn the bolt into a burst where it met the target, its front head
+  // along its way
+  private explode(bolt: Bolt, target: Target, head: number) {
     const along =
       (target.position.x - bolt.origin.x) * bolt.direction.x +
       (target.position.z - bolt.origin.z) * bolt.direction.z;
     impact.copy(bolt.origin).addScaledVector(bolt.direction, along);
     bolt.burst = 0;
     bolt.origin.copy(impact);
+    bolt.head = head - along;
     bolt.light.distance = BURST_LIGHT_RANGE;
-    coneAxis
-      .copy(bolt.direction)
-      .applyAxisAngle(yAxis, THREE.MathUtils.randFloatSpread(CONE_JITTER * 2));
-    coneAxis.y = THREE.MathUtils.randFloatSpread(CONE_JITTER);
-    bolt.coneRotation.setFromUnitVectors(yAxis, coneAxis.normalize());
-    // Random size, and a little random in its proportions
-    const size = THREE.MathUtils.randFloat(CONE_MIN_SIZE, 1);
-    bolt.coneLength = CONE_LENGTH * size;
-    bolt.coneRadius = CONE_RADIUS * size * THREE.MathUtils.randFloat(0.75, 1);
+    bolt.light.position.copy(impact);
 
     this.sparks.burst(impact, bolt.direction);
     this.blood.burst(impact, bolt.direction);
     this.mist.burst(impact, bolt.direction);
   }
 
-  // The cone of fire, the bolt slammed into a flying head, and the light
-  // flashing and dying
+  // The bolt flowing into the impact and splatting, and the light flashing
+  // and dying
   private updateBurst(bolt: Bolt, delta: number) {
     bolt.burst += delta;
     if (bolt.burst >= BURST_TIME) {
       bolt.burst = -1;
-      this.hideCone(bolt);
       this.end(bolt);
       return;
     }
-
-    // The cone shoots out to full length, widening, as it fades
-    const shot = Math.min(bolt.burst / CONE_TIME, 1);
-    const reach = 1 - (1 - shot) ** 3;
-    if (shot < 1) {
-      coneScale.set(bolt.coneRadius * reach, bolt.coneLength * reach, bolt.coneRadius * reach);
-      this.cones.setMatrixAt(bolt.index, coneMatrix.compose(bolt.origin, bolt.coneRotation, coneScale));
-      this.cones.setColorAt(bolt.index, coneGlow.setScalar((1 - shot) ** 3));
-      this.cones.instanceMatrix.needsUpdate = true;
-      this.cones.instanceColor!.needsUpdate = true;
-    } else {
-      this.hideCone(bolt);
-    }
-    // Slam: bolt length and thickness to the flat head's, then thin away
-    // while spreading. Sizes along the path include the capsule's caps
-    const slam = 1 - (1 - Math.min(bolt.burst / HEAD_SLAM, 1)) ** 2;
-    const fade = Math.min(Math.max((bolt.burst - HEAD_SLAM) / (HEAD_FADE - HEAD_SLAM), 0), 1);
-    const fullLength = BOLT_LENGTH + BOLT_RADIUS * 2;
-    const length = THREE.MathUtils.lerp(fullLength, HEAD_THICKNESS, slam) * (1 - fade);
-    const radius =
-      THREE.MathUtils.lerp(BOLT_RADIUS, HEAD_RADIUS, slam) * THREE.MathUtils.lerp(1, HEAD_SPREAD, fade);
-    bolt.mesh.visible = length > 0;
-    bolt.mesh.scale.set(radius / BOLT_RADIUS, length / fullLength, radius / BOLT_RADIUS);
-    // Its front flies on from the impact (kept in origin) at the bolt's speed
-    bolt.mesh.position
-      .copy(bolt.origin)
-      .addScaledVector(bolt.direction, BOLT_SPEED * bolt.burst - length / 2);
-    // The flash sits a little way into the cone
     bolt.light.intensity = BURST_LIGHT * (1 - bolt.burst / BURST_TIME) ** 2;
-    bolt.light.position.copy(bolt.origin).addScaledVector(bolt.direction, bolt.coneLength * 0.25);
+
+    // Its front this far past the impact, in metres and in the mesh's own
+    // units along it (scaled by its length)
+    const front = bolt.head + SPLAT_SPEED * bolt.burst;
+    const length = bolt.mesh.scale.y;
+    bolt.mesh.visible = front < BOLT_LENGTH * length + SPLAT_REACH;
+    bolt.mesh.position.copy(bolt.origin).addScaledVector(bolt.direction, front - (BOLT_LENGTH * length) / 2);
+    bolt.mesh.userData.cut = ((BOLT_LENGTH * length) / 2 - front) / length;
   }
 
   private sweep(bolt: Bolt, from: number, to: number) {
@@ -450,11 +387,6 @@ export class BoltPool {
       return target;
     }
     return null;
-  }
-
-  private hideCone(bolt: Bolt) {
-    this.cones.setMatrixAt(bolt.index, hidden);
-    this.cones.instanceMatrix.needsUpdate = true;
   }
 
   private end(bolt: Bolt) {
@@ -471,8 +403,7 @@ export class BoltPool {
     this.bloodMaterial.dispose();
     this.mistGeometry.dispose();
     this.mistMaterial.dispose();
-    this.coneGeometry.dispose();
     this.material.dispose();
-    this.coneMaterial.dispose();
+    this.boltMaterial.dispose();
   }
 }

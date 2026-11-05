@@ -1,6 +1,3 @@
-import { useFrame, useThree } from "@react-three/fiber";
-import { useControls } from "leva";
-import { useRef, useMemo, useEffect } from "react";
 import * as THREE from "three/webgpu";
 import {
   Fn,
@@ -156,11 +153,33 @@ function createBladeGeometry(bladeCount: number) {
   return geom;
 }
 
+// The trail and blood maps, the only grass state kept from frame to frame,
+// so they outlive rebuilds.
+// The trail map wraps around the world, so it covers the ball wherever it
+// rolls: each cell holds the xz push vector (bend direction scaled by
+// strength) that blades rooted there get, a life that counts down from 1
+// so the blades recover with an ease-out, and the id of the world tile it
+// currently covers, so cells reused for a new tile read as empty.
+// The blood map is over the same cells: how bloody, and the tile id
+function createMaps() {
+  const trailMap = instancedArray(TRAIL_RES * TRAIL_RES, "vec4");
+  const bloodMap = instancedArray(TRAIL_RES * TRAIL_RES, "vec2");
+  // Empty: no tile has the id NOWHERE
+  const blood = bloodMap.value.array;
+  for (let i = 1; i < blood.length; i += 2) blood[i] = NOWHERE;
+  return { trailMap, bloodMap };
+}
+
 // With bladeLit, the grass lights itself instead of using three's lights:
 // the point lights once per blade, at its root and tip, in the update
 // compute, and the sun and ambient light per pixel. Only the chosen path
 // is built into the shaders
-function createGrass(bladeCount: number, stains: Stains, bladeLit: boolean) {
+function createGrass(
+  bladeCount: number,
+  stains: Stains,
+  bladeLit: boolean,
+  { trailMap, bloodMap }: ReturnType<typeof createMaps>
+) {
   const uniforms = {
     time: uniform(0),
     // Bottom-left cell of the slot grid in the view's ground grid, its
@@ -222,14 +241,6 @@ function createGrass(bladeCount: number, stains: Stains, bladeLit: boolean) {
     array.updateType = THREE.NodeUpdateType.OBJECT;
   }
 
-  // Trail map that wraps around the world, so it covers the ball wherever it
-  // rolls: each cell holds the xz push vector (bend direction scaled by
-  // strength) that blades rooted there get, a life that counts down from 1
-  // so the blades recover with an ease-out, and the id of the world tile it
-  // currently covers, so cells reused for a new tile read as empty
-  const trailMap = instancedArray(TRAIL_RES * TRAIL_RES, "vec4");
-  // Blood map over the same cells: how bloody, and the tile id
-  const bloodMap = instancedArray(TRAIL_RES * TRAIL_RES, "vec2");
   const tileId = (tile: THREE.Node<"vec2">) => tile.x.mul(4096.0).add(tile.y);
   // A world cell's (unwrapped) index in the maps, and its tile
   const wrapCell = (c: THREE.Node<"vec2">) => {
@@ -240,11 +251,6 @@ function createGrass(bladeCount: number, stains: Stains, bladeLit: boolean) {
 
   // Springs up fast, then settles gently into rest over a fixed time
   const recovery = (life: THREE.Node<"float">) => life.mul(life);
-
-  const clearTrail = Fn(() => {
-    trailMap.element(instanceIndex).assign(vec4(0.0));
-    bloodMap.element(instanceIndex).assign(vec2(0.0, NOWHERE));
-  })().compute(TRAIL_RES * TRAIL_RES);
 
   // Fade the map back towards rest, then stamp the pushers' footprints
   const stampTrail = Fn(() => {
@@ -527,10 +533,15 @@ function createGrass(bladeCount: number, stains: Stains, bladeLit: boolean) {
       widthVar.add(thicken.mul(4.0).mul(upright)).mul(select(culled, 0.0, 1.0))
     );
 
-    // Blood painted where this blade is rooted
-    const { index: bloodIndex, tile: bloodTile } = wrapCell(floor(grassPos.div(TRAIL_TEXEL)));
-    const bloodCell = bloodMap.element(bloodIndex);
-    const blood = select(bloodCell.y.equal(tileId(bloodTile)), bloodCell.x, 0.0);
+    // Blood painted where this blade is rooted or where its tip rests, so
+    // blades leaning over a stain take it too. Not where wind or trails
+    // bend it, or blades would flicker in and out of the stain
+    const bloodAt = (pos: THREE.Node<"vec2">) => {
+      const { index, tile } = wrapCell(floor(pos.div(TRAIL_TEXEL)));
+      const cell = bloodMap.element(index);
+      return select(cell.y.equal(tileId(tile)), cell.x, 0.0);
+    };
+    const blood = max(bloodAt(grassPos), bloodAt(grassPos.add(restBend)));
 
     // Shadow effect from sphere
     const distanceToSphere = length(grassPos.sub(uniforms.spherePosition.xz));
@@ -710,7 +721,6 @@ function createGrass(bladeCount: number, stains: Stains, bladeLit: boolean) {
 
   return {
     uniforms,
-    clearTrail,
     stampTrail,
     stampDents,
     paintStains,
@@ -718,7 +728,8 @@ function createGrass(bladeCount: number, stains: Stains, bladeLit: boolean) {
     material,
     dispose: () => {
       material.dispose();
-      for (const buffer of [...buffers, trailMap, bloodMap]) buffer?.value.dispose?.();
+      for (const buffer of buffers) buffer?.value.dispose?.();
+      for (const compute of [stampTrail, stampDents, paintStains, update]) compute.dispose();
     },
   };
 }
@@ -784,104 +795,90 @@ function mirrorLights(
   uniforms.lightCount.value = count;
 }
 
-export default function WebGPUGrass({
-  spherePosition,
-  pushers,
-  stains,
-  look,
-  sunPosition,
-}: {
-  spherePosition?: THREE.Vector3;
+// Sliders for the field; density and height (and bladeLit) rebuild it
+export const grassSettings = {
+  density: 55,
+  bladeHeight: 1.5,
+  windSpeed: 1.0,
+  trailRecovery: 10,
+  ridge: 0.6,
+  // Lights the grass itself, point lights once per blade, instead of with
+  // three's per pixel lights
+  bladeLit: true,
+};
+
+// The grass field: a mesh to add to the scene, rebuild() whenever the view's
+// size or a rebuilding setting changes, and update() every frame
+export function grassField(
+  renderer: THREE.WebGPURenderer,
+  stains: Stains,
   // Feet positions that flatten the grass as they move, at most MAX_PUSHERS
-  pushers: Set<THREE.Vector3>;
-  stains: Stains;
-  look: GrassLook;
-  sunPosition: [number, number, number];
-}) {
-  const renderer = useThree((state) => state.gl) as unknown as THREE.WebGPURenderer;
-  const size = useThree((state) => state.size);
-  const needsClear = useRef(true);
-  const lastPushers = useRef(new Map<THREE.Vector3, THREE.Vector2>());
-
-  const {
-    Density: density,
-    "Blade Height": bladeHeight,
-    "Wind Speed": windSpeedLeva,
-    "Trail Recovery": trailRecovery,
-    "Blade Ridge": bladeRidge,
-    "Blade Lighting": bladeLit,
-  } = useControls("🌿 Grass Field", {
-    Density: { value: 60, min: 10, max: 200, step: 5 },
-    "Blade Height": { value: 1.3, min: 0.7, max: 4.0, step: 0.1 },
-    "Wind Speed": { value: 1.3, min: 0.0, max: 5.0, step: 0.1 },
-    "Trail Recovery": { value: 3.0, min: 0.2, max: 20.0, step: 0.1 },
-    "Blade Ridge": { value: 0.6, min: 0.0, max: 1.0, step: 0.05 },
-    // Lights the grass itself, point lights once per blade, instead of with
-    // three's per pixel lights. ?light=three starts with three's
-    "Blade Lighting": new URLSearchParams(location.search).get("light") !== "three",
-  });
-
+  pushers: Set<THREE.Vector3>,
+  // Where the player is, for the shadow under it
+  player: THREE.Vector3
+) {
+  const mesh = new THREE.Mesh();
+  mesh.frustumCulled = false;
+  // Drawn before the ground it covers, so GPUs that only skip hidden
+  // pixels behind what's already drawn (all but Apple's) skip shading the
+  // ground beneath. Its slots already run from the camera outwards
+  mesh.renderOrder = -1;
+  const maps = createMaps();
+  let grass: ReturnType<typeof createGrass>;
+  let lastPushers = new Map<THREE.Vector3, THREE.Vector2>();
   // Slot grid covering the ground the fixed iso view sees, in the view's
   // ground axes relative to the point at the centre of the screen
-  const grid = useMemo(() => {
-    const cellSize = 1 / Math.sqrt(density);
-    const width = (ISO_VIEW_HEIGHT * size.width) / size.height + 2 * BEND_MARGIN;
+  const grid = { cellSize: 1, columns: 0, minRight: 0, minUp: 0 };
+
+  function rebuild(aspect: number) {
+    const { density, bladeHeight, bladeLit } = grassSettings;
+    grid.cellSize = 1 / Math.sqrt(density);
+    const width = ISO_VIEW_HEIGHT * aspect + 2 * BEND_MARGIN;
     const depth = ISO_VIEW_HEIGHT / Math.sin(ISO_ELEVATION);
     // Blades rooted below the bottom edge still reach up into view
     const nearMargin = (bladeHeight + 0.8) / Math.tan(ISO_ELEVATION) + BEND_MARGIN;
-    return {
-      cellSize,
-      columns: Math.ceil(width / cellSize),
-      rows: Math.ceil((depth + nearMargin + BEND_MARGIN) / cellSize),
-      minRight: -width / 2,
-      minUp: -depth / 2 - nearMargin,
-    };
-  }, [density, bladeHeight, size.width, size.height]);
-  const bladeCount = grid.columns * grid.rows;
+    grid.columns = Math.ceil(width / grid.cellSize);
+    grid.minRight = -width / 2;
+    grid.minUp = -depth / 2 - nearMargin;
+    const bladeCount = grid.columns * Math.ceil((depth + nearMargin + BEND_MARGIN) / grid.cellSize);
 
-  const geometry = useMemo(() => createBladeGeometry(bladeCount), [bladeCount]);
-  const grass = useMemo(
-    () => createGrass(bladeCount, stains, bladeLit),
-    [bladeCount, stains, bladeLit]
-  );
-
-  useEffect(() => () => geometry.dispose(), [geometry]);
-  useEffect(() => () => grass.dispose(), [grass]);
-
-  useEffect(() => {
-    needsClear.current = true;
-  }, [grass]);
-
-  useEffect(() => {
+    dispose();
+    grass = createGrass(bladeCount, stains, bladeLit, maps);
+    mesh.geometry = createBladeGeometry(bladeCount);
+    mesh.material = grass.material;
     grass.uniforms.gridWidth.value = grid.columns;
     grass.uniforms.cellSize.value = grid.cellSize;
     grass.uniforms.grassHeight.value = bladeHeight;
-  }, [grass, grid, bladeHeight]);
+  }
 
-  useEffect(() => {
-    grass.uniforms.windSpeed.value = windSpeedLeva;
-  }, [grass, windSpeedLeva]);
+  function dispose() {
+    grass?.dispose();
+    mesh.geometry.dispose();
+  }
 
-  useEffect(() => {
-    grass.uniforms.ridge.value = bladeRidge;
-  }, [grass, bladeRidge]);
-
-  useEffect(() => {
-    grass.uniforms.specular.value.set(look.specular);
-    grass.uniforms.shininess.value = look.shininess;
-    grass.uniforms.tipTint.value.fromArray(look.tipTint);
-    grass.uniforms.translucency.value = look.translucency;
-    grass.uniforms.wetness.value = look.wetness;
-    grass.uniforms.sunDirection.value.fromArray(sunPosition).normalize();
-  }, [grass, look, sunPosition]);
-
-  useFrame((state, delta) => {
+  function update(
+    delta: number,
+    time: number,
+    scene: THREE.Scene,
+    camera: THREE.Camera,
+    look: GrassLook,
+    sunPosition: [number, number, number]
+  ) {
     const { uniforms } = grass;
-    uniforms.time.value = state.clock.elapsedTime;
-    if (bladeLit) mirrorLights(state.scene, state.camera, uniforms);
+    uniforms.time.value = time;
+    uniforms.windSpeed.value = grassSettings.windSpeed;
+    uniforms.ridge.value = grassSettings.ridge;
+    uniforms.trailFadeStep.value = delta / grassSettings.trailRecovery;
+    uniforms.specular.value.set(look.specular);
+    uniforms.shininess.value = look.shininess;
+    uniforms.tipTint.value.fromArray(look.tipTint);
+    uniforms.translucency.value = look.translucency;
+    uniforms.wetness.value = look.wetness;
+    uniforms.sunDirection.value.fromArray(sunPosition).normalize();
+    uniforms.spherePosition.value.copy(player);
+    if (grassSettings.bladeLit) mirrorLights(scene, camera, uniforms);
 
     // Ground point at the centre of the screen, in view ground axes
-    const { camera } = state;
     camera.getWorldDirection(viewDirection);
     const t = -camera.position.y / viewDirection.y;
     const centerX = camera.position.x + viewDirection.x * t;
@@ -893,30 +890,19 @@ export default function WebGPUGrass({
       Math.floor((up + grid.minUp) / grid.cellSize)
     );
 
-    uniforms.trailFadeStep.value = delta / trailRecovery;
-
-    if (spherePosition) uniforms.spherePosition.value.copy(spherePosition);
-
     // Each pusher's path since last frame; one that just joined starts
     // where it is, so a spawn doesn't streak across the field
     const seen = new Map<THREE.Vector3, THREE.Vector2>();
     let slot = 0;
     for (const position of pushers) {
       if (slot === MAX_PUSHERS) break;
-      const last = lastPushers.current.get(position) ?? new THREE.Vector2(position.x, position.z);
+      const last = lastPushers.get(position) ?? new THREE.Vector2(position.x, position.z);
       uniforms.pushers[slot++].value.set(last.x, last.y, position.x, position.z);
       seen.set(position, last.set(position.x, position.z));
     }
-    for (; slot < MAX_PUSHERS; slot++) {
-      uniforms.pushers[slot].value.setScalar(NOWHERE);
-    }
-    lastPushers.current = seen;
+    for (; slot < MAX_PUSHERS; slot++) uniforms.pushers[slot].value.setScalar(NOWHERE);
+    lastPushers = seen;
 
-
-    if (needsClear.current) {
-      renderer.compute(grass.clearTrail);
-      needsClear.current = false;
-    }
     renderer.compute(grass.stampTrail);
 
     // Dents are stamped once, on top of the trails
@@ -937,17 +923,7 @@ export default function WebGPUGrass({
     });
     if (spreading) renderer.compute(grass.paintStains);
     renderer.compute(grass.update);
-  });
+  }
 
-  return (
-    // Drawn before the ground it covers, so GPUs that only skip hidden
-    // pixels behind what's already drawn (all but Apple's) skip shading the
-    // ground beneath. Its slots already run from the camera outwards
-    <mesh
-      geometry={geometry}
-      material={grass.material}
-      frustumCulled={false}
-      renderOrder={-1}
-    />
-  );
+  return { mesh, rebuild, update };
 }

@@ -1,8 +1,6 @@
-import { useLoader } from "@react-three/fiber";
-import { useMemo } from "react";
 import * as THREE from "three/webgpu";
 import { mix, output, positionWorld, smoothstep, vec4 } from "three/tsl";
-import { GLTFLoader, type GLTF } from "three/examples/jsm/loaders/GLTFLoader.js";
+import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { MeshoptDecoder } from "three/examples/jsm/libs/meshopt_decoder.module.js";
 import { clone as cloneSkinned } from "three/examples/jsm/utils/SkeletonUtils.js";
 
@@ -152,10 +150,9 @@ export type BotAssets = {
   rifleMaterial: THREE.Material;
 };
 
-// Built once per loaded file, since every bot shares its materials
-const assetCache = new WeakMap<GLTF, BotAssets>();
-
-function buildAssets(gltf: GLTF): BotAssets {
+// Loaded once: every bot shares the model's geometry and materials
+export async function loadBotAssets(): Promise<BotAssets> {
+  const gltf = await new GLTFLoader().setMeshoptDecoder(MeshoptDecoder).loadAsync(MODEL_URL);
   // The baked file's root: the model, with the clips' authored ground
   // speeds (before MODEL_SCALE) in its extras
   const model = gltf.scene.children[0] as THREE.Group;
@@ -188,20 +185,6 @@ function buildAssets(gltf: GLTF): BotAssets {
   });
 
   return { model, materials, clips, speeds, recoil, rifleGeometry, rifleMaterial };
-}
-
-export function useBotAssets(): BotAssets {
-  const gltf = useLoader(GLTFLoader, MODEL_URL, (loader) =>
-    loader.setMeshoptDecoder(MeshoptDecoder)
-  );
-  return useMemo(() => {
-    let assets = assetCache.get(gltf);
-    if (!assets) {
-      assets = buildAssets(gltf);
-      assetCache.set(gltf, assets);
-    }
-    return assets;
-  }, [gltf]);
 }
 
 type Gait = { action: THREE.AnimationAction; stride: number; speed: number };

@@ -1,24 +1,22 @@
 import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
+import { fileURLToPath } from 'node:url'
 
-// https://vite.dev/config/
+// three's own source modules rather than its prebuilt bundles, so the
+// bundler drops what's unused (the WebGL fallback among it)
+const three = (path: string) => fileURLToPath(new URL(`./node_modules/three/src/${path}`, import.meta.url))
+
 export default defineConfig({
-  plugins: [react()],
   // Relative, so the build works from any path (GitHub Pages serves it
   // under /<repo>/)
   base: './',
   resolve: {
-    // Everything, including R3F and three's addons, imports three's
-    // WebGPU build, so the unused WebGL renderer and shaders stay out
-    alias: [{ find: /^three$/, replacement: 'three/webgpu' }],
+    alias: [
+      { find: /^three\/src\/(.*)$/, replacement: three('$1') },
+      { find: /^three\/tsl$/, replacement: three('Three.TSL.js') },
+      // three's addons import three, which must be its WebGPU build
+      { find: /^three(\/webgpu)?$/, replacement: three('Three.WebGPU.js') },
+    ],
   },
-  build: {
-    rollupOptions: {
-      onwarn(warning, warn) {
-        // R3F's fallback WebGLRenderer, unused: the app passes its own
-        if (warning.message.includes('"WebGLRenderer" is not exported')) return
-        warn(warning)
-      },
-    },
-  },
+  // main.ts awaits at the top level
+  build: { target: 'es2022' },
 })
